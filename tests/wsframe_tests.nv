@@ -1,0 +1,218 @@
+// tests/wsframe_tests.nv — the API tests for the frame arithmetic,
+// written against the signatures.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// websocket-codec-nv.wsframe.<fn>` from the `todo()` that is each body.
+// That is the expected state of an interface release: the compiler has
+// checked every signature, every type and every effect row, and nothing
+// else has been checked because there is nothing else yet.
+//
+// The vectors are RFC 6455 § 5.7's own.
+
+use std.test
+use wsframe
+
+// RFC 6455 § 5.7: a single-frame masked text message "Hello".
+fn masked_hello() -> [u8]
+    [0x81 as u8, 0x85 as u8,
+     0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8,
+     0x7F as u8, 0x9F as u8, 0x4D as u8, 0x51 as u8, 0x58 as u8]
+
+// The same message unmasked, as a server would send it.
+fn unmasked_hello() -> [u8]
+    [0x81 as u8, 0x05 as u8,
+     0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8]
+
+fn the_rfc_mask_key() -> [u8]
+    [0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8]
+
+@test
+fn test_an_opcode_round_trips_through_its_four_bits() [io]
+    test.case("the five named opcodes")
+    test.assert(wsframe.opcode_number(Continuation) == 0x0)
+    test.assert(wsframe.opcode_number(TextFrame) == 0x1)
+    test.assert(wsframe.opcode_number(BinaryFrame) == 0x2)
+    test.assert(wsframe.opcode_number(ConnectionClose) == 0x8)
+    test.assert(wsframe.opcode_number(Ping) == 0x9)
+    test.assert(wsframe.opcode_number(Pong) == 0xA)
+
+    test.case("and a reserved one keeps its number")
+    match wsframe.opcode_of(0x5)
+        None     => test.fail("0x5 is a legal four-bit value")
+        Some(op) => test.assert(wsframe.opcode_number(op) == 0x5)
+
+    test.case("but 16 is not a four-bit value at all")
+    match wsframe.opcode_of(16)
+        None    => test.assert(true)
+        Some(_) => test.fail("an opcode is four bits")
+
+@test
+fn test_the_control_opcodes_are_the_ones_with_the_high_bit() [io]
+    test.case("is_control")
+    test.assert(wsframe.is_control(ConnectionClose))
+    test.assert(wsframe.is_control(Ping))
+    test.assert(wsframe.is_control(Pong))
+    test.assert(not wsframe.is_control(TextFrame))
+    test.assert(not wsframe.is_control(BinaryFrame))
+    test.assert(not wsframe.is_control(Continuation))
+
+@test
+fn test_the_length_form_is_the_minimal_one() [io]
+    // A length of 100 written in the 16-bit form is a protocol error
+    // and not a wasteful encoding, because accepting both would let two
+    // peers disagree about where a frame ends.
+    test.case("minimal_length_form")
+    test.assert(wsframe.minimal_length_form(0) == 0)
+    test.assert(wsframe.minimal_length_form(125) == 0)
+    test.assert(wsframe.minimal_length_form(126) == 2)
+    test.assert(wsframe.minimal_length_form(65535) == 2)
+    test.assert(wsframe.minimal_length_form(65536) == 8)
+
+@test
+fn test_a_scan_of_a_whole_frame_gives_its_length() [io]
+    test.case("the RFC's masked Hello")
+    match wsframe.scan(masked_hello())
+        NeedMore    => test.fail("eleven bytes are the whole of that frame")
+        Complete(n) => test.assert(n == 11)
+
+    test.case("a prefix asks for more")
+    match wsframe.scan([0x81 as u8])
+        NeedMore    => test.assert(true)
+        Complete(_) => test.fail("one byte cannot be a whole frame")
+
+@test
+fn test_the_mask_is_its_own_inverse() [io]
+    // One function rather than a mask and an unmask, because RFC 6455
+    // § 5.3's transformation is XOR with a repeating key.
+    test.case("mask twice is the identity")
+    let plain = [0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8]
+    let once = wsframe.mask(plain, the_rfc_mask_key())
+    test.assert(once[0] as Int == 0x7F)
+    let back = wsframe.mask(once, the_rfc_mask_key())
+    test.assert(back[0] as Int == 0x48)
+    test.assert(back[4] as Int == 0x6F)
+
+@test
+fn test_a_client_frame_arrives_masked_and_a_server_frame_does_not() [io]
+    test.case("a server reads a masked frame")
+    match wsframe.decode_header(masked_hello(), ServerSide)
+        Err(_) => test.fail("a client frame is masked, and this is one")
+        Ok(h)  =>
+            test.assert(h.fin)
+            test.assert(h.masked)
+            test.assert(h.payload_len == 5)
+
+    test.case("a client reads an unmasked frame")
+    match wsframe.decode_header(unmasked_hello(), ClientSide)
+        Err(_) => test.fail("a server frame is unmasked, and this is one")
+        Ok(h)  => test.assert(not h.masked)
+
+@test
+fn test_a_server_refuses_an_unmasked_client_frame() [io]
+    // RFC 6455 § 5.1 makes masking mandatory from the client, and a
+    // server that accepted an unmasked frame is the cache-poisoning
+    // hole the mask exists to close.
+    test.case("unmasked, to a server")
+    match wsframe.decode_header(unmasked_hello(), ServerSide)
+        Ok(_)  => test.fail("a server must fail an unmasked frame")
+        Err(e) =>
+            match e
+                UnmaskedClientFrame => test.assert(true)
+                _                   => test.fail("the refusal names the rule")
+
+@test
+fn test_a_client_refuses_a_masked_server_frame() [io]
+    test.case("masked, to a client")
+    match wsframe.decode_header(masked_hello(), ClientSide)
+        Ok(_)  => test.fail("a server must not mask")
+        Err(e) =>
+            match e
+                MaskedServerFrame => test.assert(true)
+                _                 => test.fail("the refusal names the rule")
+
+@test
+fn test_a_reserved_bit_is_refused_because_no_extension_negotiated_it() [io]
+    test.case("RSV1 set")
+    // 0xC1 is fin + rsv1 + text.
+    let rsv = [0xC1 as u8, 0x05 as u8,
+               0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8]
+    match wsframe.decode_header(rsv, ClientSide)
+        Ok(_)  => test.fail("this package negotiates no extensions")
+        Err(e) =>
+            match e
+                ReservedBitSet(b) => test.assert(b == 1)
+                _                 => test.fail("the refusal names the bit")
+
+@test
+fn test_a_control_frame_is_small_and_whole() [io]
+    test.case("the constant is the RFC's")
+    test.assert(wsframe.CONTROL_PAYLOAD_MAX == 125)
+    test.assert(wsframe.MASK_KEY_LEN == 4)
+
+    test.case("a fragmented control frame is refused")
+    // 0x09 is ping with fin CLEAR.
+    let frag = [0x09 as u8, 0x00 as u8]
+    match wsframe.decode_header(frag, ClientSide)
+        Ok(_)  => test.fail("control frames are never fragmented")
+        Err(e) =>
+            match e
+                FragmentedControlFrame(_) => test.assert(true)
+                _                         => test.fail("the refusal says which rule")
+
+@test
+fn test_a_header_knows_how_long_it_is() [io]
+    test.case("header_len")
+    let h = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: TextFrame, masked: true, payload_len: 5,
+        mask_key: Some(the_rfc_mask_key()) }
+    // Two fixed bytes, no extended length, four of mask key.
+    test.assert(wsframe.header_len(h) == 6)
+
+@test
+fn test_a_frame_round_trips_through_its_wire_bytes() [io]
+    test.case("encode then decode")
+    let h = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: TextFrame, masked: true, payload_len: 5,
+        mask_key: Some(the_rfc_mask_key()) }
+    let f = WsFrame {
+        header: h,
+        payload: [0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8] }
+    match wsframe.encode(f)
+        Err(_)    => test.fail("that is a well-formed frame")
+        Ok(bytes) =>
+            test.assert(list.len(bytes) == 11)
+            test.assert(bytes[0] as Int == 0x81)
+            // What encode wrote, decode reads — with the mask removed.
+            match wsframe.decode(bytes, ServerSide)
+                Err(_)   => test.fail("what encode wrote, decode reads")
+                Ok(back) => test.assert(back.payload[0] as Int == 0x48)
+
+@test
+fn test_a_header_encodes_to_the_bytes_the_rfc_prints() [io]
+    test.case("encode_header")
+    let h = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: TextFrame, masked: false, payload_len: 5, mask_key: None }
+    match wsframe.encode_header(h)
+        Err(_)    => test.fail("that is a well-formed header")
+        Ok(bytes) =>
+            test.assert(list.len(bytes) == 2)
+            test.assert(bytes[0] as Int == 0x81)
+            test.assert(bytes[1] as Int == 0x05)
+
+@test
+fn test_a_frame_that_lies_about_its_length_is_refused() [io]
+    test.case("a header declaring more than the payload holds")
+    let h = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: BinaryFrame, masked: false, payload_len: 99, mask_key: None }
+    match wsframe.encode(WsFrame { header: h, payload: [0x00 as u8] })
+        Ok(_)  => test.fail("a frame that lies about its length is unrecoverable")
+        Err(e) =>
+            match e
+                LengthDisagreesWithPayload(d, a) =>
+                    test.assert(d == 99)
+                    test.assert(a == 1)
+                _                                => test.fail("the refusal names both")

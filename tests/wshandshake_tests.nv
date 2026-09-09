@@ -1,0 +1,227 @@
+// tests/wshandshake_tests.nv — the API tests for the upgrade, written
+// against the signatures.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+//
+// Two of them assert something the compiler has ALREADY decided:
+// `test_the_nonce_is_the_caller_s` compiles only because `client_key`
+// takes the sixteen bytes rather than generating them, which is what
+// keeps `[rand]` out of a `core` package; and the handshake is spelled
+// in http-codec-nv's `H1Request` and `H1Response`, so this file
+// type-checks only if that dependency really carries the types.
+
+use std.test
+use wshandshake
+use wserr
+use h1msg
+
+// RFC 6455 § 1.3's own example key, and the accept value it produces.
+fn the_rfc_key() -> Str
+    "dGhlIHNhbXBsZSBub25jZQ=="
+
+fn the_rfc_accept() -> Str
+    "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+// A well-formed client handshake, in HTTP/1.1's own types.
+fn a_handshake() -> H1Request
+    H1Request {
+        method: Get,
+        target: "/chat",
+        version: Http11,
+        headers: h1msg.headers([
+            H1Header { name: "Host", value: "server.example.com" },
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Key", value: the_rfc_key() },
+            H1Header { name: "Sec-WebSocket-Version", value: "13" }]) }
+
+@test
+fn test_the_accept_key_is_the_one_the_rfc_prints() [io]
+    // The one line of the handshake that is arithmetic, and the reason
+    // it can live in a `core` package while the exchange around it
+    // cannot.
+    test.case("base64(sha1(key + GUID))")
+    test.assert(wshandshake.accept_key(the_rfc_key()) == the_rfc_accept())
+
+@test
+fn test_the_protocol_constants_are_the_rfc_s() [io]
+    test.case("the GUID, the version and the nonce length")
+    test.assert(wshandshake.WS_GUID == "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    test.assert(wshandshake.WS_VERSION == 13)
+    test.assert(wshandshake.NONCE_LEN == 16)
+
+@test
+fn test_the_nonce_is_the_caller_s() [io]
+    // THE SIGNATURE IS THE CLAIM.  `client_key(nonce)` takes the
+    // sixteen random bytes rather than generating them, which is what
+    // keeps `[rand]` off a `core` package — and what makes this
+    // assertion possible at all, since a test cannot assert against a
+    // value it did not choose.
+    test.case("the RFC's example nonce gives the RFC's example key")
+    let nonce = [0x74 as u8, 0x68 as u8, 0x65 as u8, 0x20 as u8,
+                 0x73 as u8, 0x61 as u8, 0x6D as u8, 0x70 as u8,
+                 0x6C as u8, 0x65 as u8, 0x20 as u8, 0x6E as u8,
+                 0x6F as u8, 0x6E as u8, 0x63 as u8, 0x65 as u8]
+    match wshandshake.client_key(nonce)
+        Err(_) => test.fail("sixteen bytes are a legal nonce")
+        Ok(k)  => test.assert(k == the_rfc_key())
+
+@test
+fn test_a_nonce_of_the_wrong_length_is_the_host_s_mistake() [io]
+    test.case("fifteen bytes")
+    match wshandshake.client_key([0x00 as u8])
+        Ok(_)  => test.fail("a nonce is sixteen bytes")
+        Err(e) =>
+            match e
+                NonceWrongLength(n) => test.assert(n == 1)
+                _                   => test.fail("the refusal names the length")
+
+@test
+fn test_a_key_is_the_base64_of_sixteen_bytes_and_nothing_else() [io]
+    test.case("is_valid_key")
+    test.assert(wshandshake.is_valid_key(the_rfc_key()))
+    test.assert(not wshandshake.is_valid_key("too-short"))
+    test.assert(not wshandshake.is_valid_key(""))
+
+@test
+fn test_a_well_formed_handshake_is_read() [io]
+    test.case("check_upgrade_request")
+    match wshandshake.check_upgrade_request(a_handshake())
+        Err(_) => test.fail("that is RFC 6455 § 4.1's own example")
+        Ok(u)  =>
+            test.assert(u.key == the_rfc_key())
+            test.assert(u.version == 13)
+            test.assert(list.len(u.protocols) == 0)
+
+@test
+fn test_a_request_that_is_not_an_upgrade_is_told_apart_cheaply() [io]
+    // The test a router does before it commits to the handshake.  A
+    // request that fails it is an ordinary HTTP request and belongs to
+    // whatever route matched it, which is why the answer is a Bool.
+    test.case("is_websocket_upgrade")
+    test.assert(wshandshake.is_websocket_upgrade(a_handshake()))
+    let plain = H1Request {
+        method: Get, target: "/", version: Http11,
+        headers: h1msg.headers([H1Header { name: "Host", value: "e.org" }]) }
+    test.assert(not wshandshake.is_websocket_upgrade(plain))
+
+@test
+fn test_the_wrong_version_gets_a_426_that_says_which_version() [io]
+    // A 426 without `Sec-WebSocket-Version: 13` tells the client
+    // nothing it can act on, which is why the whole response is a value
+    // rather than a status a caller assembles.
+    test.case("version 8")
+    let old = H1Request {
+        method: Get, target: "/chat", version: Http11,
+        headers: h1msg.headers([
+            H1Header { name: "Host", value: "server.example.com" },
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Key", value: the_rfc_key() },
+            H1Header { name: "Sec-WebSocket-Version", value: "8" }]) }
+    match wshandshake.check_upgrade_request(old)
+        Ok(_)  => test.fail("this package speaks 13 and nothing else")
+        Err(e) =>
+            match e
+                UnsupportedVersion(v) => test.assert(v == 8)
+                _                     => test.fail("the refusal names the version")
+
+    test.case("and the answer carries the version that is spoken")
+    let refusal = wshandshake.version_refusal()
+    test.assert(refusal.status == 426)
+    match h1msg.get(refusal.headers, "sec-websocket-version")
+        Some(v) => test.assert(v == "13")
+        None    => test.fail("a 426 without the field says nothing")
+
+    test.case("and http_status_for agrees")
+    match wserr.http_status_for(UnsupportedVersion(8))
+        Some(s) => test.assert(s == 426)
+        None    => test.fail("a version refusal has an answer")
+
+@test
+fn test_a_missing_upgrade_field_is_refused() [io]
+    test.case("no Upgrade")
+    let bare = H1Request {
+        method: Get, target: "/chat", version: Http11,
+        headers: h1msg.headers([
+            H1Header { name: "Host", value: "server.example.com" },
+            H1Header { name: "Sec-WebSocket-Key", value: the_rfc_key() },
+            H1Header { name: "Sec-WebSocket-Version", value: "13" }]) }
+    match wshandshake.check_upgrade_request(bare)
+        Ok(_)  => test.fail("RFC 6455 § 4.1 requires Upgrade: websocket")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_client_s_request_is_built_in_http_s_own_types() [io]
+    // The dependency, asserted: the handshake is an HTTP/1.1 exchange
+    // and is spelled in HTTP/1.1's types, so a server does not parse
+    // the request twice with two parsers that eventually disagree.
+    test.case("upgrade_request")
+    match wshandshake.upgrade_request("server.example.com", "/chat", the_rfc_key(), [])
+        Err(_)  => test.fail("that is a well-formed handshake")
+        Ok(req) =>
+            test.assert(req.target == "/chat")
+            match h1msg.get(req.headers, "sec-websocket-key")
+                Some(k) => test.assert(k == the_rfc_key())
+                None    => test.fail("the key is what the server answers")
+
+@test
+fn test_the_server_s_101_answers_the_key_it_was_sent() [io]
+    test.case("upgrade_response")
+    match wshandshake.upgrade_response(the_rfc_key(), None)
+        Err(_)   => test.fail("that is a well-formed key")
+        Ok(resp) =>
+            test.assert(resp.status == 101)
+            match h1msg.get(resp.headers, "sec-websocket-accept")
+                Some(a) => test.assert(a == the_rfc_accept())
+                None    => test.fail("a 101 without the accept is not a handshake")
+
+@test
+fn test_a_client_refuses_a_101_that_answers_a_different_key() [io]
+    // The check that stops a cache from replaying somebody else's 101
+    // at a client, which is the attack the key/accept pair exists for.
+    test.case("a mismatched accept")
+    let wrong = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Accept", value: "AAAAAAAAAAAAAAAAAAAAAAAAAAA=" }]) }
+    match wshandshake.check_upgrade_response(the_rfc_key(), [], wrong)
+        Ok(_)  => test.fail("that accept answers a different key")
+        Err(e) =>
+            match e
+                AcceptMismatch(w, _) => test.assert(w == the_rfc_accept())
+                _                    => test.fail("the refusal names both values")
+
+@test
+fn test_a_client_refuses_a_subprotocol_it_did_not_offer() [io]
+    test.case("an unrequested subprotocol")
+    let resp = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Accept", value: the_rfc_accept() },
+            H1Header { name: "Sec-WebSocket-Protocol", value: "superchat" }]) }
+    match wshandshake.check_upgrade_response(the_rfc_key(), ["chat"], resp)
+        Ok(_)  => test.fail("the client offered chat and not superchat")
+        Err(e) =>
+            match e
+                UnrequestedProtocol(n) => test.assert(n == "superchat")
+                _                      => test.fail("the refusal names the protocol")
+
+@test
+fn test_an_ordinary_http_answer_is_not_a_handshake_failure_to_debug() [io]
+    // A 401 or a 3xx is an ordinary HTTP answer the client should
+    // handle as one, and this variant is how it finds out to.
+    test.case("a 401")
+    let denied = H1Response {
+        version: Http11, status: 401, reason: "Unauthorized",
+        headers: h1msg.no_headers() }
+    match wshandshake.check_upgrade_response(the_rfc_key(), [], denied)
+        Ok(_)  => test.fail("a 401 is not a 101")
+        Err(e) =>
+            match e
+                NotSwitchingProtocols(s) => test.assert(s == 401)
+                _                        => test.fail("the refusal carries the status")

@@ -1,0 +1,179 @@
+// wshandshake.nv — the RFC 6455 § 4 upgrade, as a computation.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE HOST PERFORMS THE EXCHANGE; THIS PACKAGE COMPUTES IT.
+//
+// A handshake is an HTTP/1.1 request and an HTTP/1.1 response, and the
+// only part of it that is not string handling is one line: the accept
+// key is `base64(sha1(client_key + GUID))`.  Everything else is
+// checking that six fields say what the RFC requires.  None of that
+// needs a socket, so none of it is here as an effect — the functions
+// BUILD the request and the response and CHECK the ones that arrive,
+// and the host writes and reads them.
+//
+// THE NONCE IS AN ARGUMENT, AND THAT IS THE DESIGN
+//
+//     pub fn client_key(nonce: [u8]) -> Result<Str, WsHandshakeError>
+//
+// A client's `Sec-WebSocket-Key` is sixteen random bytes, base64'd.
+// Randomness is a host effect (`[rand]`), and this package is `core`,
+// so a `client_key()` that generated its own nonce would have put a
+// `[rand]` row on a package that claims none — and, worse, would have
+// made the handshake untestable, because a test cannot assert against a
+// value it did not choose.  The nonce arrives from the caller; the RFC
+// 6455 § 1.3 example nonce is what `tests/` uses, and it produces the
+// accept key the RFC prints.
+//
+// The same reasoning puts the mask keys in `wswrite.message_frames`'
+// argument list.  A sans-IO codec does not ask for entropy; it is
+// handed it.
+//
+// THE TYPES ARE HTTP/1.1'S
+//
+// `check_upgrade_request` takes an `H1Request` and `upgrade_response`
+// returns an `H1Response`, from http-codec-nv.  A second set of
+// header types invented here would have meant a server parsing the
+// request twice — once as HTTP to route it, once again as a handshake
+// — and the two parsers disagreeing eventually.
+
+// The magic string RFC 6455 § 4.2.2 appends to the client key before
+// hashing.  It is a constant of the protocol and identical in every
+// implementation.
+pub const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// The only WebSocket version RFC 6455 defines, and the only one this
+// package speaks.
+pub const WS_VERSION = 13
+
+// The number of random bytes behind a `Sec-WebSocket-Key`.
+pub const NONCE_LEN = 16
+
+// WsUpgrade is what a server learned from a client's handshake
+// request.
+//
+// The key is carried because the server needs it to compute the accept
+// value, and the two lists because choosing from them is the server's
+// decision and not this package's: a codec that picked a subprotocol
+// would be picking one for every application that used it.
+pub struct WsUpgrade
+    // The `Sec-WebSocket-Key` exactly as it arrived.
+    key: Str
+    // The version the client asked for.  Always 13 if this value
+    // exists, because any other is `UnsupportedVersion`.
+    version: Int
+    // The subprotocols offered, in the client's order of preference.
+    protocols: [Str]
+    // The extensions offered.  This package negotiates none, so a
+    // server built on it answers with none — but it can see what was
+    // asked for.
+    extensions: [Str]
+
+// accept_key is the answer to a client key: `base64(sha1(key + GUID))`.
+//
+// The one line of the handshake that is arithmetic.  It is a pure
+// function of the key, which is exactly why it can live in a `core`
+// package while the exchange around it cannot.
+//
+// SHA-1 here is not a security claim.  The value proves only that the
+// far end read the request and knows the RFC, which is enough to stop a
+// cache or a non-WebSocket server from being mistaken for an endpoint,
+// and is not enough for anything else.
+//
+// ```novo
+// use wshandshake
+//
+// fn main() [io]
+//     // RFC 6455 § 1.3's own example.
+//     println(wshandshake.accept_key("dGhlIHNhbXBsZSBub25jZQ=="))
+//     // s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+// ```
+pub fn accept_key(client_key: Str) -> Str
+    todo("websocket-codec-nv.wshandshake.accept_key")
+
+// client_key is a `Sec-WebSocket-Key` from sixteen bytes the caller
+// supplies.
+//
+// The nonce is an argument because randomness is a host effect and this
+// package has none.  A caller passes `rand.bytes(16)`; a test passes
+// the RFC's example bytes and gets the RFC's example key.
+pub fn client_key(nonce: [u8]) -> Result<Str, WsHandshakeError>
+    todo("websocket-codec-nv.wshandshake.client_key")
+
+// is_valid_key says whether a string is the base64 of exactly sixteen
+// bytes.
+//
+// The check a server does before it answers, exported because a proxy
+// that forwards a handshake wants the same answer without the rest of
+// the request.
+pub fn is_valid_key(key: Str) -> Bool
+    todo("websocket-codec-nv.wshandshake.is_valid_key")
+
+// upgrade_request is the client's handshake request, ready to be
+// written.
+//
+// `host` goes in the `Host` field and `target` is the origin-form path;
+// `protocols` may be empty, and when it is, no
+// `Sec-WebSocket-Protocol` field is written rather than an empty one.
+pub fn upgrade_request(host: Str, target: Str, key: Str,
+                       protocols: [Str]) -> Result<H1Request, WsHandshakeError>
+    todo("websocket-codec-nv.wshandshake.upgrade_request")
+
+// check_upgrade_request reads a client's handshake request, or says
+// which of RFC 6455 § 4.1's requirements it failed.
+//
+// It checks six things and no more: a GET at HTTP/1.1, an `Upgrade`
+// naming websocket, a `Connection` naming Upgrade, a well-formed
+// `Sec-WebSocket-Key`, `Sec-WebSocket-Version: 13`, and that the field
+// values parse. It does NOT check the `Origin`, and it does not choose
+// a subprotocol: both are policy, both are the server's, and a codec
+// that decided either would be deciding it for every server built on
+// it.
+pub fn check_upgrade_request(req: H1Request) -> Result<WsUpgrade, WsHandshakeError>
+    todo("websocket-codec-nv.wshandshake.check_upgrade_request")
+
+// upgrade_response is the server's 101, answering a key.
+//
+// `protocol` is the subprotocol the server chose from what the client
+// offered, or `None` for none.  It must be one the client offered —
+// `check_upgrade_response` on the far end refuses anything else — and
+// this function does not check that, because the server holding the
+// `WsUpgrade` is the party that knows.
+pub fn upgrade_response(key: Str, protocol: ?Str) -> Result<H1Response, WsHandshakeError>
+    todo("websocket-codec-nv.wshandshake.upgrade_response")
+
+// check_upgrade_response reads a server's answer against the key that
+// was sent, and gives back the subprotocol that was agreed.
+//
+// `offered` is what the client asked for, because a server that chose
+// a subprotocol nobody offered is a fault the client must catch — and
+// cannot catch without the list.  `Ok(None)` means no subprotocol was
+// agreed, which is ordinary.
+//
+// THE ACCEPT CHECK IS NOT A FORMALITY.  It is what stops a cache from
+// replaying an unrelated 101 at a client, which is the attack the
+// key/accept pair exists for.
+pub fn check_upgrade_response(sent_key: Str, offered: [Str],
+                              resp: H1Response) -> Result<?Str, WsHandshakeError>
+    todo("websocket-codec-nv.wshandshake.check_upgrade_response")
+
+// version_refusal is the whole 426 a server answers a wrong
+// `Sec-WebSocket-Version` with, carrying the version it does speak.
+//
+// RFC 6455 § 4.4 requires the field, and a 426 without it tells the
+// client nothing it can act on.  A named value rather than a shape
+// each server assembles, for the same reason
+// `h1write.continue_head` is one.
+pub fn version_refusal() -> H1Response
+    todo("websocket-codec-nv.wshandshake.version_refusal")
+
+// is_websocket_upgrade says whether an HTTP request is asking for a
+// WebSocket at all.
+//
+// The cheap test a router does before it commits to the handshake:
+// `Upgrade: websocket` and a `Connection` that names it.  A request
+// that fails this is an ordinary HTTP request and belongs to whatever
+// route matched it, which is why the answer is a `Bool` rather than
+// the refusal `check_upgrade_request` would produce.
+pub fn is_websocket_upgrade(req: H1Request) -> Bool
+    todo("websocket-codec-nv.wshandshake.is_websocket_upgrade")

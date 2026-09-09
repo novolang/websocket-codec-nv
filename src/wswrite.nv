@@ -1,0 +1,135 @@
+// wswrite.nv — WebSocket messages as frames, and frames as bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A WRITER RETURNS FRAMES, NOT BYTES ON A SOCKET.  It does not take a
+// writer and it does not send: a library does not decide for the
+// program that embeds it that something goes out
+// (`docs/publishing.md` § Design).  What comes back is frames the
+// caller encodes with `wsframe.encode` and writes, or `bytes` for the
+// caller that wants one call.
+//
+// THE MASK KEYS ARE ARGUMENTS
+//
+//     pub fn message_frames(msg, max_payload, mask_keys) -> Result<[WsFrame], _>
+//
+// Every client frame carries four random bytes.  Randomness is a host
+// effect (`[rand]`) and this package is `core`, so a writer that
+// generated its own keys would have put a `[rand]` row on a package
+// that claims none — and would have made every test of fragmentation
+// unassertable, because the bytes would differ per run.  So the caller
+// supplies one key per frame the fragmentation will produce, and
+// `frame_count` says how many that is BEFORE you have to supply them.
+// A server supplies none, because a server does not mask.
+//
+// It is the same decision `wshandshake.client_key` makes about the
+// nonce, and the same one `smp-nv` makes about pairing entropy: a
+// sans-IO codec is handed its randomness rather than asking for it.
+
+use wsframe
+use wsclose
+use wsread
+
+// frame_count is how many frames a message of this size becomes when
+// fragmented at `max_payload` bytes.
+//
+// Call it before `message_frames` to know how many mask keys to
+// generate.  A message of zero bytes is one frame, not zero: an empty
+// text message is a thing a sender may send.
+//
+// ```novo
+// use wswrite
+//
+// fn main() [io]
+//     println("${wswrite.frame_count(10000, 4096)}")   // 3
+//     println("${wswrite.frame_count(0, 4096)}")       // 1
+// ```
+pub fn frame_count(payload_len: Int, max_payload: Int) -> Int
+    todo("websocket-codec-nv.wswrite.frame_count")
+
+// message_frames fragments a message into frames, masking each with the
+// key supplied for it.
+//
+// The first frame carries the message's opcode and the rest carry
+// `Continuation`; only the last carries `fin`.  Pass `mask_keys` of
+// length `frame_count(…)` from a client and an empty list from a
+// server; a mismatch is `NotEnoughMaskKeys` rather than a silently
+// unmasked frame.
+//
+// `max_payload` of zero or less is refused: it would produce infinitely
+// many frames.  A caller that does not want fragmentation passes a
+// number larger than the message.
+pub fn message_frames(msg: WsMessage, max_payload: Int,
+                      mask_keys: [[u8]]) -> Result<[WsFrame], WsEncodeError>
+    todo("websocket-codec-nv.wswrite.message_frames")
+
+// text is one unfragmented text frame.
+//
+// The payload is bytes rather than a `Str` for the reason
+// `WsMessage.TextMessage` carries bytes: this package does not decide
+// what is valid text, it reports what is.  A caller with a `Str` has
+// valid UTF-8 by construction and converts.
+pub fn text(utf8: [u8], mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.text")
+
+// binary is one unfragmented binary frame.
+pub fn binary(data: [u8], mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.binary")
+
+// ping is a ping frame.
+//
+// Refuses a payload over 125 bytes, which is the control-frame
+// constraint and not a suggestion: a peer that received an oversized
+// control frame must fail the connection.
+pub fn ping(payload: [u8], mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.ping")
+
+// pong is a pong frame.
+//
+// The answer to a `wsread.ControlPing`, and RFC 6455 § 5.5.3 says it
+// carries the ping's payload unchanged — which is why the payload is a
+// parameter and not something this package could have invented.
+pub fn pong(payload: [u8], mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.pong")
+
+// close_frame is a close frame carrying a code and a reason.
+//
+// Refuses a code `wsclose.is_sendable` says may not go on the wire —
+// 1005, 1006 and 1015 — so the frame that obliges a peer to fail the
+// connection cannot be built, whatever the calling program believed.
+// Refuses a reason over 123 bytes for the same reason `ping` refuses an
+// oversized payload.
+pub fn close_frame(c: WsClose, mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.close_frame")
+
+// continuation is one continuation frame, for a caller doing its own
+// fragmentation.
+//
+// `message_frames` is the form that gets the `fin` and the opcodes
+// right without being told; this is for the caller that is streaming a
+// body it does not hold — a file being uploaded frame by frame — and so
+// cannot hand the whole message over at once.  `fin` is the caller's to
+// set, and getting it wrong leaves the peer's reader assembling
+// forever.
+pub fn continuation(data: [u8], fin: Bool, mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.continuation")
+
+// bytes is a whole message as the bytes to write, in one call.
+//
+// `message_frames` then `wsframe.encode` on each, concatenated, for the
+// caller that holds the message and wants to hand a socket one buffer.
+// A caller that is streaming uses the frames.
+pub fn bytes(msg: WsMessage, max_payload: Int, mask_keys: [[u8]]) -> Result<[u8], WsEncodeError>
+    todo("websocket-codec-nv.wswrite.bytes")
+
+// fail_connection is the close frame to send when a decode refused
+// something.
+//
+// `wsclose.close_code_for` chooses the code RFC 6455 § 7.4.1 assigns to
+// that fault, and this wraps it in a frame ready to encode.  It exists
+// so the ordinary response to a protocol violation is one call rather
+// than a paragraph every endpoint writes slightly differently — and
+// gets slightly wrong, usually by sending 1002 for a UTF-8 fault that
+// the RFC assigns 1007.
+pub fn fail_connection(e: WsDecodeError, mask_key: ?[u8]) -> Result<WsFrame, WsEncodeError>
+    todo("websocket-codec-nv.wswrite.fail_connection")

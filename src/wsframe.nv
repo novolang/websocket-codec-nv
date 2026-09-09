@@ -1,0 +1,243 @@
+// wsframe.nv — a WebSocket frame as a value, and the arithmetic that
+// turns it into bytes and back.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// RFC 6455 § 5 is two bytes and then some conditional fields, and
+// almost every hand-written implementation of it gets one of four
+// things wrong.  Each of the four is a type or a refusal here rather
+// than a paragraph:
+//
+//   1. THE LENGTH IS NOT ONE FIELD.  It is 7 bits, or 7 bits plus 16,
+//      or 7 bits plus 64, and which one is legal depends on the value:
+//      a length of 100 written in the 16-bit form is a protocol error
+//      (`NonMinimalLength`), not a wasteful encoding.
+//   2. THE MASK IS DIRECTIONAL.  Every client frame is masked and every
+//      server frame is not, and a frame that gets it wrong must be
+//      failed rather than accepted.  `WsRole` is why `decode_header`
+//      takes one.
+//   3. A CONTROL FRAME IS SMALL AND WHOLE.  At most 125 bytes of
+//      payload, never fragmented, and legal in the middle of a
+//      fragmented data message.  That last one is what
+//      `InterleavedDataFrame` exists to distinguish from it.
+//   4. THE RESERVED BITS ARE NOT SPARE.  RSV1..3 are zero unless an
+//      extension negotiated in the handshake says otherwise, and this
+//      package negotiates no extensions, so it refuses them.
+//
+// The masking function is its own inverse, so there is one `mask` and
+// not a `mask` and an `unmask`.  It is also the only place in the
+// package where a reader touches every byte of a payload, which is
+// worth knowing before anyone optimises anything else.
+
+// WsOpcode is what a frame is for.
+//
+// The three control opcodes and the two data ones are named; everything
+// else is `ReservedOpcode`, which a conforming endpoint fails the
+// connection on.  It is a variant rather than a refusal at decode time
+// because a proxy may want to see what arrived before it decides.
+pub enum WsOpcode
+    // 0x0 — more of the message the last non-continuation frame began.
+    Continuation
+    // 0x1 — UTF-8 text.  The bytes are carried as bytes; see
+    // `is_valid_utf8`.
+    TextFrame
+    // 0x2 — an opaque payload.
+    BinaryFrame
+    // 0x8 — the close handshake.
+    ConnectionClose
+    // 0x9 — a ping.  A conforming endpoint answers with a pong carrying
+    // the same payload.
+    Ping
+    // 0xA — a pong, solicited or not.
+    Pong
+    // 0x3..0x7 and 0xB..0xF — reserved by the RFC for extensions this
+    // package does not negotiate.
+    ReservedOpcode(code: Int)
+
+// WsRole is which end of the connection this endpoint is.
+//
+// It decides the mask rule in both directions, and it is a parameter on
+// every function where the rule applies rather than a field on a
+// long-lived object, so that a proxy holding both halves cannot mix
+// them up by holding one setting.
+pub enum WsRole
+    // A client: masks what it sends, and fails an incoming masked
+    // frame.
+    ClientSide
+    // A server: sends unmasked, and fails an incoming unmasked frame.
+    ServerSide
+
+// WsFrameHeader is everything before a frame's payload.
+//
+// `payload_len` is the length the header DECLARES, which for a decoded
+// header is what the peer said and not what has arrived — those are
+// different numbers until the frame is complete, and conflating them is
+// how a reader ends up indexing past a buffer.
+pub struct WsFrameHeader
+    // The final frame of a message.  A control frame always has it set.
+    fin: Bool
+    // Reserved bits.  Zero unless an extension said otherwise, and this
+    // package negotiates no extensions, so a set bit is refused.
+    rsv1: Bool
+    rsv2: Bool
+    rsv3: Bool
+    opcode: WsOpcode
+    // Whether `mask_key` is present.  A separate field from
+    // `mask_key`'s `Some`-ness because a decode has to be able to report
+    // what the bit said even when the four bytes did not arrive.
+    masked: Bool
+    payload_len: Int
+    // The four masking bytes, present exactly when `masked`.
+    mask_key: ?[u8]
+
+// WsFrame is a header and the payload it declared, unmasked.
+//
+// A decoded frame's payload has already had the mask removed, because
+// leaving it on would mean every consumer either remembering to remove
+// it or reading noise.  An encoded frame's payload is supplied
+// unmasked and `encode` applies the mask.
+pub struct WsFrame
+    header: WsFrameHeader
+    payload: [u8]
+
+// WsScan is what a look at a partial buffer concluded.
+//
+// The deframer's length arithmetic separated from its buffer, so a
+// caller with a buffer of its own can use the rule without adopting
+// this package's state.  It is deliberately the same shape and the same
+// two variant names `hci-codec-nv` uses, because it answers the same
+// question — how much of the front of this buffer is one frame — and a
+// reader who has met one should not have to learn the other.
+pub enum WsScan
+    // The buffer holds a prefix: the length field is not all there, or
+    // it is and the payload is still arriving.
+    NeedMore
+    // A whole frame is at the front, `length` bytes long including the
+    // header and the mask key.
+    Complete(length: Int)
+
+// The largest payload a control frame may carry (RFC 6455 § 5.5).
+pub const CONTROL_PAYLOAD_MAX = 125
+
+// The mask key's length in bytes.
+pub const MASK_KEY_LEN = 4
+
+// opcode_number is the four-bit code a frame's opcode goes on the wire
+// as.
+pub fn opcode_number(op: WsOpcode) -> Int
+    todo("websocket-codec-nv.wsframe.opcode_number")
+
+// opcode_of reads a four-bit opcode, giving `ReservedOpcode` for the
+// nine the RFC has not assigned and `None` for a number outside
+// `0 ..= 15`.
+pub fn opcode_of(code: Int) -> ?WsOpcode
+    todo("websocket-codec-nv.wsframe.opcode_of")
+
+// is_control says whether an opcode is a control opcode — close, ping
+// or pong.
+//
+// The bit that decides it is 0x8, so this is one test rather than three
+// comparisons, and it is exported because the three constraints that
+// follow from it are a caller's business too: at most 125 bytes, never
+// fragmented, and legal between the fragments of a data message.
+//
+// ```novo
+// use wsframe
+//
+// fn main() [io]
+//     println("${wsframe.is_control(Ping)}")           // true
+//     println("${wsframe.is_control(BinaryFrame)}")    // false
+// ```
+pub fn is_control(op: WsOpcode) -> Bool
+    todo("websocket-codec-nv.wsframe.is_control")
+
+// header_len is how many bytes a header with these fields occupies:
+// two, plus zero, two or eight for the extended length, plus four if it
+// is masked.
+pub fn header_len(h: WsFrameHeader) -> Int
+    todo("websocket-codec-nv.wsframe.header_len")
+
+// minimal_length_form is the number of extra length bytes a payload of
+// this size must use: 0, 2 or 8.
+//
+// The rule RFC 6455 § 5.2 states as "the minimal number of bytes", and
+// the reason a length of 100 in the 16-bit form is a protocol error
+// rather than a wasteful encoding: an implementation that accepted both
+// would let two peers disagree about whether a byte stream is one frame
+// or two.
+pub fn minimal_length_form(payload_len: Int) -> Int
+    todo("websocket-codec-nv.wsframe.minimal_length_form")
+
+// scan is how much of the front of `buf` is one frame.
+//
+// Reads the two fixed bytes and then whichever length field they named,
+// and does not copy, unmask or validate anything.  A leading byte with
+// a reserved bit set is still `Complete` here — the length arithmetic
+// does not care, and refusing it is `decode_header`'s job.
+pub fn scan(buf: [u8]) -> WsScan
+    todo("websocket-codec-nv.wsframe.scan")
+
+// encode_header is a frame header as its wire bytes.
+//
+// Writes the minimal length form, so a header whose `payload_len`
+// disagrees with what `minimal_length_form` says is written correctly
+// rather than as it was asked for; the field is a length, not a wire
+// format.
+pub fn encode_header(h: WsFrameHeader) -> Result<[u8], WsEncodeError>
+    todo("websocket-codec-nv.wsframe.encode_header")
+
+// decode_header reads a frame header from the front of a buffer, for an
+// endpoint in this role.
+//
+// The role decides the mask rule: a `ServerSide` reader refuses an
+// unmasked frame and a `ClientSide` one refuses a masked frame, both
+// with `UnmaskedClientFrame` / `MaskedServerFrame` named from the
+// SENDER's side, which is how the RFC phrases them.
+//
+// It also refuses a set reserved bit, a non-minimal length, a control
+// frame over 125 bytes and a fragmented control frame — every
+// constraint that can be decided from a header alone.  What it does not
+// decide is whether this frame is legal HERE, which needs the sequence
+// and is `wsread`'s job.
+pub fn decode_header(buf: [u8], role: WsRole) -> Result<WsFrameHeader, WsDecodeError>
+    todo("websocket-codec-nv.wsframe.decode_header")
+
+// mask applies the four-byte key to a payload, and is its own inverse.
+//
+// One function rather than a `mask` and an `unmask`, because RFC 6455
+// § 5.3's transformation is XOR with a repeating key and running it
+// twice returns what you started with.  A package that offered both
+// names would be offering the same function twice and inviting a caller
+// to wonder which one it needs.
+//
+// ```novo
+// use wsframe
+//
+// fn main() [io]
+//     let key = [0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8]
+//     let once = wsframe.mask([0x48 as u8, 0x69 as u8], key)
+//     let back = wsframe.mask(once, key)
+//     println("${back[0] as Int}")     // 72 — the H it started as
+// ```
+pub fn mask(payload: [u8], key: [u8]) -> [u8]
+    todo("websocket-codec-nv.wsframe.mask")
+
+// encode is a whole frame as its wire bytes, masking the payload if the
+// header says to.
+//
+// Refuses a frame whose payload length disagrees with its header's, and
+// a masked header with no key or a key that is not four bytes: a frame
+// that lied about its own length is the one thing a peer cannot
+// recover from.
+pub fn encode(f: WsFrame) -> Result<[u8], WsEncodeError>
+    todo("websocket-codec-nv.wsframe.encode")
+
+// decode reads one whole frame from the front of a buffer, unmasking
+// the payload.
+//
+// The pair to `scan`: `scan` says how many bytes one frame is, this
+// turns exactly those bytes into a frame.  Extra bytes after the frame
+// are ignored rather than refused, so a caller that handed over a
+// buffer with two frames in it gets the first.
+pub fn decode(buf: [u8], role: WsRole) -> Result<WsFrame, WsDecodeError>
+    todo("websocket-codec-nv.wsframe.decode")

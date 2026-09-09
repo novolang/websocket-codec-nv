@@ -1,0 +1,152 @@
+// wsclose.nv — the close handshake's status code as a typed value.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY A TYPE AND NOT AN INT
+//
+// RFC 6455 § 7.4 assigns sixteen numbers and reserves four ranges, and
+// three of the sixteen — 1005, 1006 and 1015 — MUST NEVER APPEAR ON THE
+// WIRE.  They are values an application reports to its own code when
+// there was no close frame, when the connection dropped, and when TLS
+// failed; a library that hands a caller a plain `Int` invites it to put
+// one of those three in a close frame, and the peer is then obliged to
+// fail the connection.  `is_sendable` is that rule as a predicate, and
+// `wswrite.close_frame` calls it, so the illegal frame cannot be built.
+//
+// The four reserved ranges are two variants rather than a refusal.
+// `RegisteredCode` covers 3000–3999, which IANA hands out to libraries
+// and frameworks; `PrivateCode` covers 4000–4999, which an application
+// may use for anything and nobody may interpret.  A codec that refused
+// them would be refusing the half of the space designed for its
+// callers.
+
+// WsCloseCode is why a WebSocket connection is being closed.
+//
+// Every variant except the two ranged ones is a number RFC 6455 § 7.4.1
+// assigns, and the names are the RFC's.
+pub enum WsCloseCode
+    // 1000 — the purpose the connection was established for is done.
+    NormalClosure
+    // 1001 — the endpoint is going away: a server shutting down, a
+    // browser navigating.
+    GoingAway
+    // 1002 — a protocol error.  What every `WsDecodeError` about
+    // framing maps to.
+    ProtocolError
+    // 1003 — data of a type this endpoint cannot accept: binary to a
+    // text-only endpoint.
+    UnsupportedData
+    // 1005 — NO STATUS WAS RECEIVED.  Never sent; reported locally when
+    // the peer's close frame carried no code.
+    NoStatusReceived
+    // 1006 — THE CONNECTION DROPPED without a close frame.  Never sent;
+    // reported locally.
+    AbnormalClosure
+    // 1007 — a text frame or a close reason that is not valid UTF-8.
+    InvalidPayload
+    // 1008 — a message that violates a policy.  The catch-all when
+    // 1003 and 1009 do not fit, or when the real reason should not be
+    // disclosed.
+    PolicyViolation
+    // 1009 — a message too big to process.
+    MessageTooBig
+    // 1010 — the CLIENT expected an extension the server did not
+    // negotiate.  One-directional: a server uses 1008 instead.
+    MandatoryExtension
+    // 1011 — the SERVER hit an unexpected condition.  The other
+    // direction of 1010.
+    InternalError
+    // 1012 — the server is restarting.
+    ServiceRestart
+    // 1013 — the server is overloaded; try again later.
+    TryAgainLater
+    // 1014 — a gateway got an invalid response from upstream.
+    BadGateway
+    // 1015 — THE TLS HANDSHAKE FAILED.  Never sent; reported locally.
+    TlsHandshakeFailure
+    // 3000–3999 — registered with IANA by libraries and frameworks.
+    RegisteredCode(code: Int)
+    // 4000–4999 — private to an application, and meaningless to
+    // anybody else.
+    PrivateCode(code: Int)
+
+// WsClose is a close frame's contents: a code, and the reason a person
+// reads.
+//
+// `reason` is UTF-8 text and at most 123 bytes — 125 minus the two the
+// code takes — which is the constraint `wswrite.close_frame` refuses.
+// It may be empty, which is ordinary.
+pub struct WsClose
+    code: WsCloseCode
+    reason: Str
+
+// number_of is the two-byte code a close code goes on the wire as.
+//
+// Total: it answers for 1005, 1006 and 1015 too, because a caller
+// logging a local close still wants the number.  Whether it may be SENT
+// is `is_sendable`, and the two are separate questions on purpose.
+pub fn number_of(c: WsCloseCode) -> Int
+    todo("websocket-codec-nv.wsclose.number_of")
+
+// code_of reads a two-byte close code.
+//
+// Refuses a number in none of the assigned ranges — 0–999, 1016–2999,
+// and 5000 up — with `UnassignedCloseCode`, and refuses 1005, 1006 and
+// 1015 with `UnsendableCloseCode`, because a peer that sent one of
+// those broke the rule and a reader has to say which rule.
+pub fn code_of(n: Int) -> Result<WsCloseCode, WsDecodeError>
+    todo("websocket-codec-nv.wsclose.code_of")
+
+// is_sendable says whether a close code may appear in a close frame.
+//
+// False for exactly three: `NoStatusReceived`, `AbnormalClosure` and
+// `TlsHandshakeFailure`.  They are values an application reports to
+// itself, and a frame carrying one obliges the peer to fail the
+// connection.
+//
+// ```novo
+// use wsclose
+//
+// fn main() [io]
+//     println("${wsclose.is_sendable(NormalClosure)}")      // true
+//     println("${wsclose.is_sendable(AbnormalClosure)}")    // false
+// ```
+pub fn is_sendable(c: WsCloseCode) -> Bool
+    todo("websocket-codec-nv.wsclose.is_sendable")
+
+// close_code_for is the close code RFC 6455 § 7.4.1 says to answer a
+// decode refusal with.
+//
+// 1002 for a framing violation, 1007 for bad UTF-8, 1009 for a message
+// past the limit.  This is the whole reason `WsDecodeError`'s variants
+// are the RFC's vocabulary rather than a parser's internal states: the
+// answer to "the peer sent something illegal" is a specific number, and
+// a codec that made the caller choose it would get a connection failed
+// with 1002 for a UTF-8 fault by every caller in a hurry.
+pub fn close_code_for(e: WsDecodeError) -> WsCloseCode
+    todo("websocket-codec-nv.wsclose.close_code_for")
+
+// encode_payload is a close frame's payload: two big-endian bytes of
+// code, then the reason as UTF-8.
+//
+// A `NormalClosure` with an empty reason still encodes as two bytes and
+// not zero.  A zero-length close payload means "no code at all" and is
+// a different thing, which `decode_payload` reports as
+// `NoStatusReceived`.
+pub fn encode_payload(c: WsClose) -> Result<[u8], WsEncodeError>
+    todo("websocket-codec-nv.wsclose.encode_payload")
+
+// decode_payload reads a close frame's payload.
+//
+// An EMPTY payload is legal and means no status, which comes back as
+// `NoStatusReceived` with an empty reason — the one place this package
+// hands a caller a code that may not be sent, and it does so because
+// that is precisely what the code is for.  One byte is
+// `CloseFrameTooShort`; two or more is a code and a reason, and the
+// reason must be valid UTF-8.
+pub fn decode_payload(payload: [u8]) -> Result<WsClose, WsDecodeError>
+    todo("websocket-codec-nv.wsclose.decode_payload")
+
+// The longest close reason that fits beside a two-byte code in a
+// control frame's 125 bytes.
+pub const CLOSE_REASON_MAX = 123

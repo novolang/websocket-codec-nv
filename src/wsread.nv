@@ -1,0 +1,224 @@
+// wsread.nv — the load-bearing interface: a WebSocket reader that
+// performs nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE
+//
+// `websocket-codec-nv` is a `core` package, so its budget is no effects
+// at all.  A WebSocket connection is exactly the thing a caller wants
+// to stream.  The two are reconciled by a FEED-AND-DRAIN STATE MACHINE:
+// the host holds the connection, hands this package whatever bytes it
+// has, and takes back the events those bytes completed.
+//
+//     var r = wsread.reader(ServerSide, wsread.default_limits())
+//     let step = wsread.feed(r, chunk)!      // as many times as you like
+//     let more = wsread.take(step.reader)!   // until `event` is None
+//
+// REASSEMBLY IS THE READER'S JOB, AND IT IS WHY THERE ARE TWO EVENTS
+// FOR A MESSAGE
+//
+// RFC 6455 § 5.4 lets a sender split a message across any number of
+// frames, and lets control frames arrive between the pieces.  A caller
+// that wanted whole messages and got frames would write that reassembly
+// itself, badly, once per program; a caller streaming a 100 MB upload
+// wants the pieces and must not be handed a buffer of the whole thing.
+// So the reader does both: `DataFrame` for every frame as it lands, and
+// `DataMessage` for the reassembled whole, and `WsLimits.max_message`
+// bounds the second.  A caller that only wants messages ignores the
+// frame events; a caller streaming ignores the message ones and sets
+// `max_message` to zero, which turns reassembly off.
+//
+// WHAT THE READER WILL NOT DO
+//
+// It does not answer a ping.  It does not send a close in reply to a
+// close.  Both are things an endpoint must do and both are sends, and a
+// package that performs nothing cannot send: `ControlPing` and
+// `PeerClose` are events, `wswrite.pong` and `wswrite.close_frame` are
+// the answers, and the host puts them on the wire.  That seam is the
+// `core` boundary, and it is the reason websocket-nv exists above this.
+
+// WsLimits is what a reader will refuse to grow past.
+//
+// Both bounds exist because the unbounded version is a denial of
+// service that costs the attacker one open socket: a frame header can
+// declare 2^63 bytes, and a fragmented message can be extended forever
+// with one-byte continuations.
+pub struct WsLimits
+    // The largest payload a single frame may declare.  Exceeding it is
+    // `FrameTooLong`, answered with close code 1009.
+    max_frame: Int
+    // The largest reassembled message.  ZERO TURNS REASSEMBLY OFF: the
+    // reader then emits `DataFrame` events and never a `DataMessage`,
+    // which is what a caller streaming a large upload wants.
+    max_message: Int
+
+// WsEvent is one thing that came out of a reader.
+//
+// Control events are separate variants rather than frames a caller
+// inspects, because the three of them are the three things an endpoint
+// MUST act on and burying them in a general frame event is how a
+// program ends up never answering a ping.
+pub enum WsEvent
+    // One data frame, as it landed, with its mask removed.  Fires for
+    // every fragment including the last.
+    DataFrame(frame: WsFrame)
+    // A reassembled data message.  Fires after the fragment that
+    // carried `fin`, and never when `max_message` is zero.
+    DataMessage(msg: WsMessage)
+    // A ping arrived.  The endpoint must answer with a pong carrying
+    // the same payload — `wswrite.pong(payload, key)` builds it, and
+    // the host sends it.
+    ControlPing(payload: [u8])
+    // A pong arrived, solicited or not.  Nothing is required of the
+    // endpoint; it is here because an application measuring latency
+    // needs it.
+    ControlPong(payload: [u8])
+    // The peer began the close handshake.  The endpoint answers with a
+    // close frame of its own and then stops sending.
+    PeerClose(close: WsClose)
+
+// WsMessage is a reassembled application message.
+//
+// Text is carried as BYTES and not as a `Str`, deliberately.  RFC 6455
+// § 8.1 requires an endpoint to fail the connection with close code
+// 1007 on invalid UTF-8, so the invalid case has to be representable
+// long enough to be reported — and a type that could only hold valid
+// text would have forced the reader to refuse before the caller could
+// see what arrived.  `is_valid_utf8` is the check; `wsclose`'s
+// `InvalidPayload` is the answer.
+pub enum WsMessage
+    TextMessage(utf8: [u8])
+    BinaryMessage(data: [u8])
+
+// WsStep is a reader and the one event that came out of it, if one did.
+//
+// `event: None` means "no complete event in what I have been given
+// yet", which on a socket is the ordinary case and not a fault.
+pub struct WsStep
+    reader: WsReader
+    event: ?WsEvent
+
+// WsReader is the state between "some bytes turned up" and "here is an
+// event".
+//
+// Opaque: the fields are here because a struct needs them, and a caller
+// that reaches into one has coupled itself to a buffering decision this
+// package intends to change.
+pub struct WsReader
+    role: WsRole
+    limits: WsLimits
+    pending: [u8]
+    assembling: [u8]
+    consumed: Int
+
+// WsDrained is a reader and every event a drain produced.
+pub struct WsDrained
+    reader: WsReader
+    events: [WsEvent]
+
+// default_limits is a frame of 16 MiB and a message of 64 MiB.
+//
+// The numbers browsers and the common servers settle on.  An embedded
+// caller wants `embedded_limits`; a caller streaming wants
+// `max_message: 0`.
+pub fn default_limits() -> WsLimits
+    todo("websocket-codec-nv.wsread.default_limits")
+
+// embedded_limits is a frame of 1 KiB and a message of 4 KiB.
+//
+// Named rather than left to each device caller to invent, because the
+// number that matters on a microcontroller is the one that fits beside
+// everything else in 64 KiB of RAM.
+pub fn embedded_limits() -> WsLimits
+    todo("websocket-codec-nv.wsread.embedded_limits")
+
+// reader is a reader holding nothing, for one end of the connection.
+pub fn reader(role: WsRole, limits: WsLimits) -> WsReader
+    todo("websocket-codec-nv.wsread.reader")
+
+// feed adds bytes and takes one event, if the addition completed one.
+//
+// Drains ONE event.  A feed carrying three frames leaves two inside,
+// and `take` is what gets them; `drain` is that loop written once.
+//
+// ```novo
+// use wsread
+//
+// fn main() [io]
+//     let r = wsread.reader(ServerSide, wsread.default_limits())
+//     match wsread.feed(r, [0x81 as u8])
+//         Ok(step) =>
+//             match step.event
+//                 None    => println("partial, as expected")
+//                 Some(_) => println("an event")
+//         Err(e)   => println(e.message())
+// ```
+pub fn feed(r: WsReader, bytes: [u8]) -> Result<WsStep, WsDecodeError>
+    todo("websocket-codec-nv.wsread.feed")
+
+// take takes one event if a complete one is already buffered, adding
+// nothing.
+pub fn take(r: WsReader) -> Result<WsStep, WsDecodeError>
+    todo("websocket-codec-nv.wsread.take")
+
+// pending_len is how many bytes the reader is holding but has not yet
+// turned into an event.
+pub fn pending_len(r: WsReader) -> Int
+    todo("websocket-codec-nv.wsread.pending_len")
+
+// assembling_len is how many bytes of a fragmented message have
+// arrived so far.
+//
+// Separate from `pending_len` because they are bounded separately and
+// for different reasons: one is a partial frame, the other a partial
+// message, and a supervisor watching for a peer that fragments forever
+// is watching this one.
+pub fn assembling_len(r: WsReader) -> Int
+    todo("websocket-codec-nv.wsread.assembling_len")
+
+// message_open says whether a fragmented message is in progress.
+//
+// The state that makes a new data frame illegal (`InterleavedDataFrame`)
+// and a continuation legal, and a caller deciding whether it may start
+// sending its own message needs the same answer for its own direction.
+pub fn message_open(r: WsReader) -> Bool
+    todo("websocket-codec-nv.wsread.message_open")
+
+// closed says whether a close frame has been received.
+//
+// After this is true no further frame is legal, and the reader refuses
+// one with `FrameAfterClose`.  A caller checks it to know when it may
+// stop reading and close the socket.
+pub fn closed(r: WsReader) -> Bool
+    todo("websocket-codec-nv.wsread.closed")
+
+// is_valid_utf8 says whether a byte list is well-formed UTF-8.
+//
+// Here rather than left to the caller because RFC 6455 § 8.1 makes it a
+// protocol requirement rather than an application nicety: a text frame
+// or a close reason that fails this must fail the CONNECTION with close
+// code 1007, and an endpoint that skipped the check would be
+// non-conforming in a way its peers can detect.  It rejects surrogates
+// and overlong forms, which a naive check accepts and the Autobahn
+// suite tests for.
+pub fn is_valid_utf8(bytes: [u8]) -> Bool
+    todo("websocket-codec-nv.wsread.is_valid_utf8")
+
+// drain reads from `src` until it stops giving, and returns every event
+// that came out.
+//
+// THE LOAD-BEARING SIGNATURE OF THIS PACKAGE.  `S: Read[e]` binds the
+// effect parameter of the standard library's `Read` trait and the
+// clause is `[e]`, so the row means "whatever the impl behind `S`
+// supplies": `[io, net]` against a `TcpStream`, nothing against an
+// in-memory `Buffer`.  Naming `[e]` has not spent an effect — it has
+// said "whatever you hand me" — which is what lets a `core` package
+// offer the read-until-empty loop instead of making every caller write
+// it (SPEC § 5.6).
+//
+// It is the ONLY function in the package with a row, and the only one
+// that could have had one: everything else takes bytes the caller
+// already holds.
+pub fn drain<S: Read[e]>(r: WsReader, src: S) -> Result<WsDrained, WsDecodeError> [e]
+    todo("websocket-codec-nv.wsread.drain")

@@ -1,0 +1,242 @@
+// tests/wsread_tests.nv — the API tests for the reader and the writer,
+// written against the signatures.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+//
+// `test_drain_over_a_buffer_costs_nothing` is the one the package's
+// `core` claim rests on, and the compiler decides it before the run
+// starts: had `drain` spent an effect instead of binding one, this file
+// would not compile.
+//
+// One match in this file is split in two where a single nested pattern
+// would read better.  A binding introduced two constructors deep is an
+// E6000 internal compiler error today
+// (`a-struct-bound-two-constructors-deep-in-a-match-pattern-is-an-ice`,
+// filed from this lane); nothing in the package changed for it.
+
+use std.test
+use wsread
+use wswrite
+use wsframe
+
+// RFC 6455 § 5.7: a single-frame masked text message "Hello".
+fn masked_hello() -> [u8]
+    [0x81 as u8, 0x85 as u8,
+     0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8,
+     0x7F as u8, 0x9F as u8, 0x4D as u8, 0x51 as u8, 0x58 as u8]
+
+fn a_server_reader() -> WsReader
+    wsread.reader(ServerSide, wsread.default_limits())
+
+fn a_key() -> [u8]
+    [0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8]
+
+@test
+fn test_a_fresh_reader_holds_nothing() [io]
+    test.case("a new reader")
+    let r = a_server_reader()
+    test.assert(wsread.pending_len(r) == 0)
+    test.assert(wsread.assembling_len(r) == 0)
+    test.assert(not wsread.message_open(r))
+    test.assert(not wsread.closed(r))
+
+@test
+fn test_a_prefix_is_not_an_event_and_not_an_error() [io]
+    test.case("one byte of a frame")
+    match wsread.feed(a_server_reader(), [0x81 as u8])
+        Err(_)   => test.fail("an incomplete frame is not malformed")
+        Ok(step) =>
+            match step.event
+                None    => test.assert(true)
+                Some(_) => test.fail("one byte cannot complete a frame")
+
+@test
+fn test_a_whole_frame_comes_out_as_a_frame_and_then_as_a_message() [io]
+    // Both events, because both callers exist: one wants the pieces as
+    // they land, the other wants the message.
+    test.case("the frame")
+    let first = wsread.feed(a_server_reader(), masked_hello())!
+    match first.event
+        None     => test.fail("that is a whole frame")
+        Some(ev) =>
+            match ev
+                DataFrame(f) => test.assert(list.len(f.payload) == 5)
+                _            => test.fail("a data frame arrives first")
+
+    test.case("then the reassembled message")
+    let second = wsread.take(first.reader)!
+    match second.event
+        None     => test.fail("a fin frame completes a message")
+        Some(ev) =>
+            match ev
+                DataMessage(_) => test.assert(true)
+                _              => test.fail("the message follows the frame")
+
+@test
+fn test_reassembly_is_off_when_the_message_limit_is_zero() [io]
+    // What a caller streaming a 100 MB upload wants: the pieces, and no
+    // buffer of the whole thing behind its back.
+    test.case("max_message: 0")
+    let streaming = WsLimits { max_frame: 65536, max_message: 0 }
+    let step = wsread.feed(wsread.reader(ServerSide, streaming), masked_hello())!
+    match step.event
+        None     => test.fail("the frame is whole")
+        Some(ev) =>
+            match ev
+                DataFrame(_)   => test.assert(true)
+                DataMessage(_) => test.fail("reassembly was turned off")
+                _              => test.fail("a data frame")
+
+@test
+fn test_a_frame_past_the_limit_is_refused() [io]
+    test.case("max_frame")
+    let tiny = WsLimits { max_frame: 2, max_message: 16 }
+    match wsread.feed(wsread.reader(ServerSide, tiny), masked_hello())
+        Ok(_)  => test.fail("five bytes is past a cap of two")
+        Err(e) =>
+            match e
+                FrameTooLong(_, cap) => test.assert(cap == 2)
+                _                    => test.fail("the refusal names the cap")
+
+@test
+fn test_the_two_named_limit_sets_differ_by_orders_of_magnitude() [io]
+    test.case("default_limits and embedded_limits")
+    let big = wsread.default_limits()
+    let small = wsread.embedded_limits()
+    test.assert(small.max_frame < big.max_frame)
+    test.assert(small.max_message < big.max_message)
+
+@test
+fn test_utf8_validity_is_checked_here_because_the_rfc_makes_it_a_protocol_rule() [io]
+    // RFC 6455 § 8.1 answers invalid UTF-8 in a text frame by failing
+    // the CONNECTION with close code 1007, so an endpoint that skipped
+    // the check is non-conforming in a way its peers can detect.
+    test.case("valid")
+    test.assert(wsread.is_valid_utf8([0x48 as u8, 0x69 as u8]))
+
+    test.case("a lone continuation byte is not")
+    test.assert(not wsread.is_valid_utf8([0x80 as u8]))
+
+    test.case("and neither is an overlong form")
+    test.assert(not wsread.is_valid_utf8([0xC0 as u8, 0x80 as u8]))
+
+@test
+fn test_the_writer_says_how_many_mask_keys_it_will_need() [io]
+    // Call it before `message_frames`, because the keys are the
+    // caller's to generate — which is what keeps `[rand]` off a `core`
+    // package.
+    test.case("frame_count")
+    test.assert(wswrite.frame_count(10000, 4096) == 3)
+    test.assert(wswrite.frame_count(4096, 4096) == 1)
+
+    test.case("an empty message is one frame, not zero")
+    test.assert(wswrite.frame_count(0, 4096) == 1)
+
+@test
+fn test_a_message_fragments_into_frames_the_caller_supplied_keys_for() [io]
+    test.case("message_frames")
+    let msg = BinaryMessage([0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8])
+    match wswrite.message_frames(msg, 2, [a_key(), a_key()])
+        Err(_) => test.fail("two keys for two frames")
+        Ok(fs) => test.assert(list.len(fs) == 2)
+
+    test.case("and refuses to invent one it was not given")
+    match wswrite.message_frames(msg, 2, [a_key()])
+        Ok(_)  => test.fail("one key cannot mask two frames")
+        Err(e) =>
+            match e
+                NotEnoughMaskKeys(want, got) =>
+                    test.assert(want == 2)
+                    test.assert(got == 1)
+                _                            => test.fail("the refusal names both")
+
+@test
+fn test_a_fragment_size_of_zero_would_be_infinitely_many_frames() [io]
+    test.case("max_payload: 0")
+    match wswrite.message_frames(BinaryMessage([0x00 as u8]), 0, [])
+        Ok(_)  => test.fail("that would never terminate")
+        Err(e) =>
+            match e
+                BadFragmentSize(n) => test.assert(n == 0)
+                _                  => test.fail("the refusal names the size")
+
+@test
+fn test_a_control_frame_will_not_be_built_oversized() [io]
+    test.case("a ping over 125 bytes")
+    // `list.range` is what the stdlib has; there is no `list.repeat`,
+    // and the map is the shortest honest way to 126 zero bytes.
+    let big = list.map(list.range(0, 126), i => 0 as u8)
+    match wswrite.ping(big, None)
+        Ok(_)  => test.fail("a peer must fail the connection over an oversized control frame")
+        Err(e) =>
+            match e
+                ControlPayloadTooLong(n) => test.assert(n == 126)
+                _                        => test.fail("the refusal names the length")
+
+@test
+fn test_a_close_frame_with_a_local_code_cannot_be_built() [io]
+    // The predicate is called by the encoder, so a program that never
+    // read the documentation still cannot send 1006.
+    test.case("close_frame refuses AbnormalClosure")
+    match wswrite.close_frame(WsClose { code: AbnormalClosure, reason: "" }, None)
+        Ok(_)  => test.fail("1006 may never appear in a frame")
+        Err(_) => test.assert(true)
+
+    test.case("and builds an ordinary one")
+    match wswrite.close_frame(WsClose { code: NormalClosure, reason: "bye" }, None)
+        Ok(f)  => test.assert(wsframe.is_control(f.header.opcode))
+        Err(_) => test.fail("1000 with a short reason is ordinary")
+
+@test
+fn test_failing_the_connection_is_one_call() [io]
+    // So the ordinary response to a protocol violation is not a
+    // paragraph every endpoint writes slightly differently, and gets
+    // slightly wrong by sending 1002 for a UTF-8 fault.
+    test.case("fail_connection")
+    match wswrite.fail_connection(BadUtf8InPayload(3), None)
+        Err(_) => test.fail("a refusal always has an answer")
+        Ok(f)  => test.assert(list.len(f.payload) >= 2)
+
+@test
+fn test_the_writer_returns_frames_and_bytes_rather_than_sending_either() [io]
+    test.case("text")
+    match wswrite.text([0x48 as u8, 0x69 as u8], Some(a_key()))
+        Ok(f)  => test.assert(f.header.fin)
+        Err(_) => test.fail("two bytes are a legal text frame")
+
+    test.case("binary")
+    match wswrite.binary([0x00 as u8], None)
+        Ok(f)  => test.assert(not f.header.masked)
+        Err(_) => test.fail("one byte is a legal binary frame")
+
+    test.case("pong carries the ping's payload unchanged")
+    match wswrite.pong([0x01 as u8, 0x02 as u8], None)
+        Ok(f)  => test.assert(list.len(f.payload) == 2)
+        Err(_) => test.fail("two bytes fit in a control frame")
+
+    test.case("continuation, for a caller doing its own fragmentation")
+    match wswrite.continuation([0x03 as u8], false, None)
+        Ok(f)  => test.assert(not f.header.fin)
+        Err(_) => test.fail("a non-final continuation is ordinary")
+
+    test.case("bytes, for a caller that wants one buffer")
+    match wswrite.bytes(BinaryMessage([0x00 as u8]), 4096, [])
+        Ok(b)  => test.assert(list.len(b) == 3)
+        Err(_) => test.fail("one byte unmasked is a three-byte frame")
+
+@test
+fn test_drain_over_a_buffer_costs_nothing() [io]
+    // THE CLAIM THIS PACKAGE'S `core` LAYER RESTS ON, and the compiler
+    // has already decided it by the time this runs.  `drain<S: Read[e]>`
+    // binds the standard library's `Read` effect parameter;
+    // `impl Read[] for Buffer` supplies nothing; so this function's row
+    // is `[io]` for the `println` in `test.fail` alone.  Had `drain`
+    // spent an effect instead — `[io, net]`, say, because "it reads a
+    // socket" — this file would not compile, and that refusal is the
+    // assertion.
+    test.case("drain over an in-memory Buffer")
+    let src = Buffer.from_str("")
+    match wsread.drain(a_server_reader(), src)
+        Ok(d)  => test.assert(list.len(d.events) == 0)
+        Err(_) => test.fail("an empty source produces no events and no fault")
+    src.drop()

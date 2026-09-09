@@ -1,0 +1,51 @@
+[package]
+name        = "websocket-codec-nv"
+version     = "0.0.1"
+description = "The WebSocket frame arithmetic with no socket under it: frame headers to and from bytes, the mask, fragmentation and reassembly, the control-frame constraints, close codes as a typed value, and the RFC 6455 handshake as a pure computation the host performs the exchange for.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: frames in, frames out, and no connection.  The two things a
+# WebSocket endpoint needs from the machine — a random 16-byte nonce for
+# the client key, and a random 4-byte mask per client frame — arrive as
+# ARGUMENTS rather than as effects this package declares, which is the
+# whole reason the handshake and the writer are shaped the way they are.
+# The one function that takes a stream — `wsread.drain` — binds the
+# standard library's `Read[e]` rather than naming an effect (SPEC § 5.6).
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["websocket", "rfc6455", "framing", "handshake", "codec", "sans-io", "masking", "fragmentation"]
+repository  = "https://github.com/novolang/websocket-codec-nv"
+maintainers = ["novo-lang"]
+
+[docs.pages]
+"README.md" = "WebSocket frames, without a socket"
+
+[dependencies]
+# The handshake is an HTTP/1.1 exchange (RFC 6455 § 4), so it is spelled
+# in HTTP/1.1's own types rather than in a second set this package would
+# have had to invent: `check_upgrade_request` takes an `H1Request` and
+# `upgrade_response` returns an `H1Response`.  Same layer, so `dep-layer`
+# holds.
+http-codec-nv = { path = "../http-codec-nv", version = "^0.0.1" }
+
+# SHA-1, for the one line of RFC 6455 § 4.2.2 that is arithmetic rather
+# than string handling: the accept key is `base64(sha1(key + GUID))`.
+# SHA-1 is broken for every purpose that depends on collisions being
+# hard, and this is not one of them — the value is a handshake token
+# neither party trusts.  `core`, so `dep-layer` holds.
+#
+# From the REGISTRY and not by path, which is not a preference: smp-nv
+# takes it as `crypto-nv = "^0.1"`, and a program that took both this
+# package and smp-nv while the two named crypto-nv differently is
+# refused — "two packages in this build are both called 'crypto-nv'".
+# The published package is the one name.
+crypto-nv = "^0.1"

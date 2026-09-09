@@ -1,0 +1,151 @@
+// tests/wsclose_tests.nv — the API tests for the close handshake's
+// status codes, written against the signatures.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+//
+// The file is mostly about three numbers.  1005, 1006 and 1015 are
+// close codes an application reports to its own code and MUST NEVER put
+// on a wire, and a library that hands a caller a plain `Int` invites
+// exactly that mistake.
+
+use std.test
+use wsclose
+
+@test
+fn test_a_close_code_round_trips_through_its_number() [io]
+    test.case("the RFC 6455 § 7.4.1 assignments")
+    test.assert(wsclose.number_of(NormalClosure) == 1000)
+    test.assert(wsclose.number_of(GoingAway) == 1001)
+    test.assert(wsclose.number_of(ProtocolError) == 1002)
+    test.assert(wsclose.number_of(UnsupportedData) == 1003)
+    test.assert(wsclose.number_of(InvalidPayload) == 1007)
+    test.assert(wsclose.number_of(PolicyViolation) == 1008)
+    test.assert(wsclose.number_of(MessageTooBig) == 1009)
+    test.assert(wsclose.number_of(InternalError) == 1011)
+
+    test.case("and reading one back")
+    match wsclose.code_of(1000)
+        Err(_) => test.fail("1000 is the ordinary close")
+        Ok(c)  => test.assert(wsclose.number_of(c) == 1000)
+
+@test
+fn test_the_three_local_codes_have_numbers_and_may_not_be_sent() [io]
+    // The distinction the type exists for.  They HAVE numbers — a
+    // caller logging a dropped connection wants to print 1006 — and
+    // they may not go in a frame.
+    test.case("the numbers are real")
+    test.assert(wsclose.number_of(NoStatusReceived) == 1005)
+    test.assert(wsclose.number_of(AbnormalClosure) == 1006)
+    test.assert(wsclose.number_of(TlsHandshakeFailure) == 1015)
+
+    test.case("and none of the three is sendable")
+    test.assert(not wsclose.is_sendable(NoStatusReceived))
+    test.assert(not wsclose.is_sendable(AbnormalClosure))
+    test.assert(not wsclose.is_sendable(TlsHandshakeFailure))
+
+    test.case("while everything else is")
+    test.assert(wsclose.is_sendable(NormalClosure))
+    test.assert(wsclose.is_sendable(GoingAway))
+    test.assert(wsclose.is_sendable(PrivateCode(4001)))
+
+@test
+fn test_a_peer_that_sends_a_local_code_is_refused() [io]
+    test.case("1006 on the wire")
+    match wsclose.code_of(1006)
+        Ok(_)  => test.fail("1006 may never appear in a frame")
+        Err(e) =>
+            match e
+                UnsendableCloseCode(n) => test.assert(n == 1006)
+                _                      => test.fail("the refusal names the code")
+
+@test
+fn test_the_two_open_ranges_are_carried_rather_than_refused() [io]
+    // 3000–3999 is IANA's for libraries; 4000–4999 is the
+    // application's.  A codec that refused them would be refusing the
+    // half of the space designed for its callers.
+    test.case("a registered code")
+    match wsclose.code_of(3100)
+        Err(_) => test.fail("3000-3999 is registered space")
+        Ok(c)  => test.assert(wsclose.number_of(c) == 3100)
+
+    test.case("a private code")
+    match wsclose.code_of(4999)
+        Err(_) => test.fail("4000-4999 is private space")
+        Ok(c)  => test.assert(wsclose.number_of(c) == 4999)
+
+@test
+fn test_a_number_in_no_assigned_range_is_refused() [io]
+    test.case("below 1000")
+    match wsclose.code_of(999)
+        Ok(_)  => test.fail("999 is assigned to nothing")
+        Err(e) =>
+            match e
+                UnassignedCloseCode(n) => test.assert(n == 999)
+                _                      => test.fail("the refusal names the code")
+
+    test.case("in the gap above 1015")
+    match wsclose.code_of(2000)
+        Ok(_)  => test.fail("1016-2999 is reserved and unassigned")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_close_payload_round_trips() [io]
+    test.case("encode then decode")
+    let c = WsClose { code: GoingAway, reason: "bye" }
+    match wsclose.encode_payload(c)
+        Err(_)      => test.fail("that is a well-formed close")
+        Ok(payload) =>
+            // Two bytes of code, then the reason as UTF-8.
+            test.assert(list.len(payload) == 5)
+            match wsclose.decode_payload(payload)
+                Err(_)   => test.fail("what encode wrote, decode reads")
+                Ok(back) => test.assert(back.reason == "bye")
+
+@test
+fn test_an_empty_close_payload_means_no_status() [io]
+    // Legal, and the one place this package hands a caller a code that
+    // may not be sent — because that is precisely what 1005 is for.
+    test.case("zero bytes")
+    match wsclose.decode_payload([])
+        Err(_)   => test.fail("a close with no code is legal")
+        Ok(back) =>
+            test.assert(wsclose.number_of(back.code) == 1005)
+            test.assert(back.reason == "")
+
+@test
+fn test_one_byte_is_half_a_code_and_is_refused() [io]
+    test.case("one byte")
+    match wsclose.decode_payload([0x03 as u8])
+        Ok(_)  => test.fail("one byte cannot be a two-byte code")
+        Err(e) =>
+            match e
+                CloseFrameTooShort(n) => test.assert(n == 1)
+                _                     => test.fail("the refusal names the length")
+
+@test
+fn test_a_local_code_cannot_be_encoded_into_a_frame() [io]
+    test.case("encode_payload refuses 1006")
+    match wsclose.encode_payload(WsClose { code: AbnormalClosure, reason: "" })
+        Ok(_)  => test.fail("the frame that obliges the peer to fail cannot be built")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_reason_longer_than_the_frame_allows_is_refused() [io]
+    test.case("the constant")
+    test.assert(wsclose.CLOSE_REASON_MAX == 123)
+
+@test
+fn test_every_decode_refusal_has_the_close_code_the_rfc_assigns_it() [io]
+    // The reason `WsDecodeError`'s variants are the RFC's vocabulary
+    // rather than a parser's internal states: the answer to "the peer
+    // sent something illegal" is a specific number, and a codec that
+    // made the caller choose it would get 1002 for everything.
+    test.case("a framing violation is 1002")
+    test.assert(wsclose.number_of(wsclose.close_code_for(UnmaskedClientFrame)) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(ReservedBitSet(1))) == 1002)
+
+    test.case("bad UTF-8 is 1007, not 1002")
+    test.assert(wsclose.number_of(wsclose.close_code_for(BadUtf8InPayload(3))) == 1007)
+
+    test.case("and a message past the limit is 1009")
+    test.assert(wsclose.number_of(wsclose.close_code_for(MessageTooLong(99, 10))) == 1009)

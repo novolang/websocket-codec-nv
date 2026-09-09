@@ -1,0 +1,10 @@
+# Build outputs.
+_novo/
+*.elf
+*.bin
+
+# The generated API page.  `novo doc` writes it here so you can read
+# what the registry will serve; the registry gets its own copy, uploaded
+# beside the archive by `novo pkg publish`.  It is generated from the
+# sources, so committing it would be committing a second original.
+APIDOC.md
