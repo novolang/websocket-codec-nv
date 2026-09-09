@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-codec-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The WebSocket frame arithmetic with no socket under it: frame headers to and from bytes, the mask, fragmentation and reassembly, the control-frame constraints, close codes as a typed value, and the RFC 6455 handshake as a pure computation the host performs the exchange for.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -25,6 +25,7 @@ category    = "networking"
 tags        = ["websocket", "rfc6455", "framing", "handshake", "codec", "sans-io", "masking", "fragmentation"]
 repository  = "https://github.com/novolang/websocket-codec-nv"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 [docs.pages]
 "README.md" = "WebSocket frames, without a socket"
