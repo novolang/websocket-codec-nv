@@ -8,5 +8,8 @@ version = "0.1.1"
 hash = "619a7d9355172f45b1ff7ceb4234a1ee5edc8ba5d14693d455f7acc495957f78"
 
 [http-codec-nv]
-source = "path"
-path = "../http-codec-nv"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.0.1"
+version = "0.0.1"
+hash = "7626f911b41aa892cc0869ce12f54ea4e0cc06c12f888f490a68cb6ebd9a70c5"

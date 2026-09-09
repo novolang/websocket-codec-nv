@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.2 — 2026-09-09
+
+- **Dependencies are registry ranges**, not paths: the interface release 0.0.1 shipped a manifest whose dependencies pointed at sibling directories that exist only in the monorepo, so a consumer resolved the closure and then could not load the dependency.  No signature changed.
+
 ## 0.0.1 — 2026-09-09
 
 The **interface**, before anyone implements it. Every signature, every
