@@ -296,9 +296,9 @@ that fits beside everything else in 64 KiB of RAM.
 
 This release ships no device probe program. A probe would have to name
 the package's own `Result` types, and a `Result` whose error type is
-declared in the package cannot be spelled at the embedded tier with this
-toolchain. The signatures keep their `Result`, and the probe arrives
-with the toolchain fix.
+declared in the package cannot be spelled in a module built for a device
+with this toolchain. The signatures keep their `Result`, and the probe
+arrives with the toolchain fix.
 
 ## What is not included
 
@@ -389,7 +389,8 @@ bodies land.
 
 ## Implementation status
 
-The types, the enum variants and the effect rows are published in full.
+Every type, every enum variant and every declared effect is published
+in full.
 This table is about the function bodies.
 
 | Item | Implemented |
