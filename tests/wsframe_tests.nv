@@ -87,10 +87,10 @@ fn test_the_mask_is_its_own_inverse() [io]
     test.case("mask twice is the identity")
     let plain = [0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8]
     let once = wsframe.mask(plain, the_rfc_mask_key())
-    test.assert(once[0] as Int == 0x7F)
+    test.assert((once[0] as Int) == 0x7F)
     let back = wsframe.mask(once, the_rfc_mask_key())
-    test.assert(back[0] as Int == 0x48)
-    test.assert(back[4] as Int == 0x6F)
+    test.assert((back[0] as Int) == 0x48)
+    test.assert((back[4] as Int) == 0x6F)
 
 @test
 fn test_a_client_frame_arrives_masked_and_a_server_frame_does_not() [io]
@@ -183,11 +183,11 @@ fn test_a_frame_round_trips_through_its_wire_bytes() [io]
         Err(_)    => test.fail("that is a well-formed frame")
         Ok(bytes) =>
             test.assert(list.len(bytes) == 11)
-            test.assert(bytes[0] as Int == 0x81)
+            test.assert((bytes[0] as Int) == 0x81)
             // What encode wrote, decode reads — with the mask removed.
             match wsframe.decode(bytes, ServerSide)
                 Err(_)   => test.fail("what encode wrote, decode reads")
-                Ok(back) => test.assert(back.payload[0] as Int == 0x48)
+                Ok(back) => test.assert((back.payload[0] as Int) == 0x48)
 
 @test
 fn test_a_header_encodes_to_the_bytes_the_rfc_prints() [io]
@@ -199,8 +199,8 @@ fn test_a_header_encodes_to_the_bytes_the_rfc_prints() [io]
         Err(_)    => test.fail("that is a well-formed header")
         Ok(bytes) =>
             test.assert(list.len(bytes) == 2)
-            test.assert(bytes[0] as Int == 0x81)
-            test.assert(bytes[1] as Int == 0x05)
+            test.assert((bytes[0] as Int) == 0x81)
+            test.assert((bytes[1] as Int) == 0x05)
 
 @test
 fn test_a_frame_that_lies_about_its_length_is_refused() [io]
