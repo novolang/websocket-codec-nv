@@ -4,6 +4,16 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.6 — 2026-09-28
+
+The dependency ranges move to the dependencies' current releases.  A
+pre-1.0 caret range admits only the release it names, so the old
+ranges held this package on interface releases, and a program could
+not take this package beside those packages' current releases.  No
+signature in this package changed.
+
+- http-codec-nv: `^0.0.1` to `^0.1.0`.
+
 ## 0.0.5 — 2026-09-25
 
 The package builds with novo 0.11.  Every body is still `todo()`.

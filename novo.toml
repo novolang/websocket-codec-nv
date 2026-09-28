@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-codec-nv"
-version     = "0.0.5"
+version     = "0.0.6"
 description = "The WebSocket frame arithmetic with no socket under it: frame headers to and from bytes, the mask, fragmentation and reassembly, the control-frame constraints, close codes as a typed value, and the RFC 6455 handshake as a pure computation the host performs the exchange for.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -36,7 +36,7 @@ novo        = ">= 0.8.9"
 # have had to invent: `check_upgrade_request` takes an `H1Request` and
 # `upgrade_response` returns an `H1Response`.  Same layer, so `dep-layer`
 # holds.
-http-codec-nv = "^0.0.1"
+http-codec-nv = "^0.1.0"
 
 # SHA-1, for the one line of RFC 6455 § 4.2.2 that is arithmetic rather
 # than string handling: the accept key is `base64(sha1(key + GUID))`.
