@@ -1,0 +1,229 @@
+// tests/refusal_tests.nv — the refusals and the short buffers the other
+// suites leave out: a buffer that ends inside a header, a length no
+// Int counts, a text message that is not UTF-8, a key that is the right
+// length and not base64, and a response that is not a handshake.
+
+use std.test
+use wsframe
+use wserr
+use wshandshake
+use wsread
+use wswrite
+use h1msg
+
+fn a_key() -> [u8]
+    [0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8]
+
+fn the_rfc_key() -> Str
+    "dGhlIHNhbXBsZSBub25jZQ=="
+
+fn plain(len: Int, op: WsOpcode) -> WsFrameHeader
+    WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: op, masked: false, payload_len: len, mask_key: None }
+
+@test
+fn test_a_buffer_that_ends_inside_a_header_is_truncated() [io]
+    test.case("one byte")
+    match wsframe.decode_header([0x81 as u8], ServerSide)
+        Ok(_)  => test.fail("one byte is not a header")
+        Err(e) =>
+            match e
+                TruncatedFrame(have) =>
+                    test.assert(have == 1)
+                    test.assert(e.message() == "1 bytes are fewer than the frame needs")
+                _                    => test.fail("the refusal names the length")
+
+    test.case("a 16-bit length with one of its two bytes")
+    match wsframe.decode_header([0x82 as u8, 0x7E as u8, 0x01 as u8], ClientSide)
+        Ok(_)  => test.fail("the length field is not all here")
+        Err(e) =>
+            match e
+                TruncatedFrame(have) => test.assert(have == 3)
+                _                    => test.fail("the refusal names the length")
+
+    test.case("a frame whose body has not arrived")
+    match wsframe.decode([0x81 as u8, 0x05 as u8, 0x48 as u8], ClientSide)
+        Ok(_)  => test.fail("four bytes of the payload are missing")
+        Err(e) =>
+            match e
+                TruncatedFrame(have) => test.assert(have == 3)
+                _                    => test.fail("the refusal names the length")
+
+@test
+fn test_a_length_no_int_counts_is_refused_by_the_header() [io]
+    test.case("the top bit of the 64-bit form")
+    let wide = [0x82 as u8, 0x7F as u8, 0x80 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    match wsframe.decode_header(wide, ClientSide)
+        Ok(_)  => test.fail("RFC 6455 section 5.2 requires that bit to be zero")
+        Err(e) =>
+            match e
+                FrameTooLong(_, _) => test.assert(true)
+                _                  => test.fail("no length can be that big")
+
+@test
+fn test_a_header_that_cannot_be_written_is_refused() [io]
+    test.case("a negative length")
+    match wsframe.encode_header(plain(-1, BinaryFrame))
+        Ok(_)  => test.fail("a length is not negative")
+        Err(e) =>
+            match e
+                LengthDisagreesWithPayload(d, a) =>
+                    test.assert(d == -1)
+                    test.assert(a == 0)
+                _                                => test.fail("the refusal names both")
+
+    test.case("a control frame of 126 bytes")
+    match wsframe.encode_header(plain(126, Ping))
+        Ok(_)  => test.fail("a control frame carries at most 125 bytes")
+        Err(e) =>
+            match e
+                ControlPayloadTooLong(n) => test.assert(n == 126)
+                _                        => test.fail("the refusal names the length")
+
+@test
+fn test_a_key_of_the_right_length_that_is_not_base64_is_refused() [io]
+    test.case("twenty-four characters ending in two pads")
+    test.assert(not wshandshake.is_valid_key("!!!!!!!!!!!!!!!!!!!!!!=="))
+    test.case("twenty-four characters without the pads")
+    test.assert(not wshandshake.is_valid_key("dGhlIHNhbXBsZSBub25jZQAA"))
+
+@test
+fn test_a_second_key_field_is_refused() [io]
+    test.case("two Sec-WebSocket-Key fields")
+    let req = H1Request {
+        method: Get, target: "/chat", version: Http11,
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Key", value: the_rfc_key() },
+            H1Header { name: "Sec-WebSocket-Key", value: the_rfc_key() },
+            H1Header { name: "Sec-WebSocket-Version", value: "13" }]) }
+    match wshandshake.check_upgrade_request(req)
+        Ok(_)  => test.fail("two keys are two answers")
+        Err(e) =>
+            match e
+                MalformedKey(_) => test.assert(true)
+                _               => test.fail("the refusal names the field")
+
+@test
+fn test_a_101_that_does_not_name_websocket_is_refused() [io]
+    test.case("Upgrade: h2c")
+    let h2c = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "h2c" },
+            H1Header { name: "Connection", value: "Upgrade" }]) }
+    match wshandshake.check_upgrade_response(the_rfc_key(), [], h2c)
+        Ok(_)  => test.fail("h2c is not websocket")
+        Err(e) =>
+            match e
+                WrongUpgradeToken(t) => test.assert(t == "h2c")
+                _                    => test.fail("the refusal quotes the token")
+
+    test.case("no Connection field")
+    let bare = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([H1Header { name: "Upgrade", value: "websocket" }]) }
+    match wshandshake.check_upgrade_response(the_rfc_key(), [], bare)
+        Ok(_)  => test.fail("the connection must be the upgrade")
+        Err(e) =>
+            match e
+                MissingConnectionUpgrade => test.assert(true)
+                _                        => test.fail("the refusal names the field")
+
+    test.case("an extension is named without its parameters")
+    let deflate = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Accept", value: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" },
+            H1Header { name: "Sec-WebSocket-Extensions",
+        value: "permessage-deflate; client_max_window_bits" }]) }
+    match wshandshake.check_upgrade_response(the_rfc_key(), [], deflate)
+        Ok(_)  => test.fail("nobody offered an extension")
+        Err(e) =>
+            match e
+                UnrequestedExtension(n) => test.assert(n == "permessage-deflate")
+                _                       => test.fail("the refusal names the extension")
+
+@test
+fn test_a_text_message_that_is_not_utf8_is_refused_when_it_ends() [io]
+    test.case("a binary-looking byte in a text frame")
+    let frame = match wswrite.text([0x48 as u8, 0xFF as u8], Some(a_key()))
+        Ok(f)  => f
+        Err(_) => WsFrame { header: plain(0, BinaryFrame), payload: [] }
+    let wire = match wsframe.encode(frame)
+        Ok(b)  => b
+        Err(_) => []
+    match wsread.feed(wsread.reader(ServerSide, wsread.default_limits()), wire)
+        Ok(_)  => test.fail("0xFF is not UTF-8")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 1)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("while the same bytes pass with reassembly off")
+    let streaming = WsLimits { max_frame: 1024, max_message: 0 }
+    match wsread.feed(wsread.reader(ServerSide, streaming), wire)
+        Err(_) => test.fail("the caller who turned reassembly off checks the text itself")
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_a_frame_that_can_never_complete_is_not_held_forever() [io]
+    test.case("an uncountable length, then more bytes than any header holds")
+    let wide = [0x82 as u8, 0xFF as u8, 0x80 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8, 0x02 as u8,
+                0x03 as u8, 0x04 as u8, 0x05 as u8]
+    match wsread.feed(wsread.reader(ServerSide, wsread.default_limits()), wide)
+        Ok(_)  => test.fail("no byte will complete that frame")
+        Err(e) =>
+            match e
+                FrameTooLong(_, cap) => test.assert(cap == 16777216)
+                _                    => test.fail("the refusal names the cap")
+
+    test.case("a cap of the largest Int still refuses a length that cannot be added to its header")
+    let near = [0x82 as u8, 0xFF as u8, 0x7F as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8,
+                0xFF as u8, 0xFF as u8, 0xFF as u8, 0xF8 as u8, 0x00 as u8, 0x00 as u8,
+                0x00 as u8, 0x00 as u8]
+    let unbounded = WsLimits { max_frame: 9223372036854775807, max_message: 0 }
+    match wsread.feed(wsread.reader(ServerSide, unbounded), near)
+        Ok(_)  => test.fail("that frame cannot be counted")
+        Err(e) =>
+            match e
+                FrameTooLong(len, _) => test.assert(len == 9223372036854775800)
+                _                    => test.fail("the refusal names the length")
+
+@test
+fn test_a_frame_count_for_no_fragment_size_is_zero() [io]
+    test.case("a size of zero")
+    test.assert(wswrite.frame_count(10, 0) == 0)
+
+@test
+fn test_the_length_is_read_before_the_frame_is_whole() [io]
+    test.case("a masked 16-bit length, with nothing after it")
+    match wsframe.read_length([0x82 as u8, 0xFE as u8, 0x01 as u8, 0x00 as u8])
+        LengthDeclared(len, head) =>
+            test.assert(len == 256)
+            test.assert(head == 8)
+        _                         => test.fail("the length field is all here")
+
+    test.case("the seven-bit form, unmasked")
+    match wsframe.read_length([0x81 as u8, 0x05 as u8])
+        LengthDeclared(len, head) =>
+            test.assert(len == 5)
+            test.assert(head == 2)
+        _                         => test.fail("the length field is all here")
+
+    test.case("the top bit of the 64-bit form")
+    match wsframe.read_length([0x82 as u8, 0x7F as u8, 0x80 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                               0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8])
+        LengthUncountable => test.assert(true)
+        _                 => test.fail("no Int counts that")
+
+    test.case("a length that has not all arrived")
+    match wsframe.read_length([0x82 as u8, 0x7E as u8])
+        LengthPending => test.assert(true)
+        _             => test.fail("two length bytes are due")

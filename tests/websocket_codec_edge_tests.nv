@@ -1,0 +1,1211 @@
+// tests/websocket_codec_edge_tests.nv — the arms the four API suites
+// leave out.
+//
+// The API suites assert what a caller does.  This one walks the tables
+// and the refusals: every assigned close code, the one-line message of
+// every refusal variant, every length form `scan` and `decode_header`
+// read, and each transition of the reader's state machine taken one
+// frame at a time.
+//
+// The vectors are RFC 6455's own where one exists: section 5.7's
+// masked "Hello" and section 1.3's nonce and accept value.
+
+use std.test
+use wsframe
+use wsclose
+use wserr
+use wshandshake
+use wsread
+use wswrite
+use h1msg
+
+// The key every masked frame below travels under, and the client key
+// and accept value of RFC 6455 § 1.3.
+fn a_key() -> [u8]
+    [0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8]
+
+fn the_rfc_client_key() -> Str
+    "dGhlIHNhbXBsZSBub25jZQ=="
+
+fn the_rfc_accept() -> Str
+    "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+fn a_server_reader() -> WsReader
+    wsread.reader(ServerSide, wsread.default_limits())
+
+// The frames of a message, or none where the builder refused.  The
+// cases below assert the length they expect, so a refusal fails them
+// rather than passing quietly.
+fn frames_of(msg: WsMessage, max_payload: Int, keys: [[u8]]) -> [WsFrame]
+    match wswrite.message_frames(msg, max_payload, keys)
+        Ok(fs) => fs
+        Err(_) => []
+
+fn wire_of(f: WsFrame) -> [u8]
+    match wsframe.encode(f)
+        Ok(bytes) => bytes
+        Err(_)    => []
+
+// A masked text frame carrying "Hello", the example § 5.7 prints.
+fn masked_hello() -> [u8]
+    [0x81 as u8, 0x85 as u8,
+     0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8,
+     0x7F as u8, 0x9F as u8, 0x4D as u8, 0x51 as u8, 0x58 as u8]
+
+// A header with the three reserved bits clear and no mask, for the
+// cases that vary one field of it.
+fn a_header(op: WsOpcode, len: Int) -> WsFrameHeader
+    WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: op, masked: false, payload_len: len, mask_key: None }
+
+// A request that is a GET at HTTP/1.1 carrying exactly the fields
+// passed in, so a case can leave one out or bend one.
+fn a_get(fields: [H1Header]) -> H1Request
+    H1Request { method: Get, target: "/chat", version: Http11,
+                headers: h1msg.headers(fields) }
+
+// The four fields § 4.1 requires, with the version supplied by the
+// caller.
+fn upgrade_fields(version: Str) -> [H1Header]
+    [H1Header { name: "Host", value: "server.example.com" },
+     H1Header { name: "Upgrade", value: "websocket" },
+     H1Header { name: "Connection", value: "Upgrade" },
+     H1Header { name: "Sec-WebSocket-Key", value: the_rfc_client_key() },
+     H1Header { name: "Sec-WebSocket-Version", value: version }]
+
+// A 101 that answers the RFC's key, carrying the fields the caller
+// adds beside the three § 4.1 requires.
+fn a_101(extra: [H1Header]) -> H1Response
+    let mandatory = [
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "Upgrade" },
+        H1Header { name: "Sec-WebSocket-Accept", value: the_rfc_accept() }]
+    H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers(list.concat(mandatory, extra)) }
+
+// ── wsframe ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_opcode_table_round_trips_at_every_assigned_value() [io]
+    test.case("the six assigned four-bit codes")
+    let codes = [0x0, 0x1, 0x2, 0x8, 0x9, 0xA]
+    for code in codes
+        match wsframe.opcode_of(code)
+            None     => test.fail("every one of those is assigned")
+            Some(op) => test.assert(wsframe.opcode_number(op) == code)
+
+    test.case("and a reserved one is carried, not dropped")
+    match wsframe.opcode_of(0x3)
+        None     => test.fail("0x3 is a four-bit value")
+        Some(op) => test.assert(wsframe.opcode_number(op) == 0x3)
+
+@test
+fn test_a_scan_reads_both_extended_length_forms() [io]
+    test.case("the 16-bit form, before its two bytes arrive")
+    match wsframe.scan([0x82 as u8, 0x7E as u8, 0x00 as u8])
+        NeedMore    => test.assert(true)
+        Complete(_) => test.fail("the second length byte has not arrived")
+
+    test.case("the 64-bit form, before its eight arrive")
+    let five = [0x82 as u8, 0x7F as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    match wsframe.scan(five)
+        NeedMore    => test.assert(true)
+        Complete(_) => test.fail("eight length bytes are due and five are here")
+
+    test.case("and a 64-bit length with its top bit set never completes")
+    // More bytes than an Int counts, so waiting for them costs ten
+    // bytes and no more.
+    let impossible = [0x82 as u8, 0xFF as u8, 0x80 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8]
+    match wsframe.scan(impossible)
+        NeedMore    => test.assert(true)
+        Complete(_) => test.fail("that declares more bytes than exist")
+
+    test.case("a masked frame in the 64-bit form, whole")
+    // Masked, 127 in the seven-bit field, eight length bytes saying
+    // four, four key bytes, four payload bytes: 2 + 8 + 4 + 4.
+    let wide = [0x82 as u8, 0xFF as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x04 as u8,
+                0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    match wsframe.scan(wide)
+        NeedMore    => test.fail("eighteen bytes are the whole of that frame")
+        Complete(n) => test.assert(n == 18)
+
+@test
+fn test_a_16_bit_length_is_read_once_its_two_bytes_arrive() [io]
+    test.case("a masked frame of two payload bytes, with only its length here")
+    let prefix = [0x82 as u8, 0x7E as u8, 0x00 as u8, 0x02 as u8]
+    match wsframe.scan(prefix)
+        NeedMore    => test.assert(true)
+        Complete(_) => test.fail("six more bytes are due: four of key and two of body")
+
+    test.case("and the whole frame completes")
+    let whole = [0x82 as u8, 0xFE as u8, 0x00 as u8, 0x02 as u8,
+                 0x37 as u8, 0xFA as u8, 0x21 as u8, 0x3D as u8,
+                 0x00 as u8, 0x00 as u8]
+    match wsframe.scan(whole)
+        NeedMore    => test.fail("that is the whole ten-byte frame")
+        Complete(n) => test.assert(n == 10)
+
+    test.case("and a header whose key has not arrived still reports its mask")
+    // The key is a separate question from `masked`: a caller that has
+    // two of the four key bytes has a masked header and no key yet.
+    let half = [0x81 as u8, 0x85 as u8, 0x37 as u8, 0xFA as u8]
+    match wsframe.decode_header(half, ServerSide)
+        Err(_) => test.fail("a masked frame from a client is ordinary")
+        Ok(h)  =>
+            test.assert(h.masked)
+            match h.mask_key
+                None    => test.assert(true)
+                Some(_) => test.fail("two of the four key bytes have not arrived")
+
+@test
+fn test_a_header_encodes_in_the_shortest_form_its_length_allows() [io]
+    test.case("126 through 65535 takes two extra bytes")
+    match wsframe.encode_header(a_header(BinaryFrame, 300))
+        Err(_) => test.fail("300 is a legal length")
+        Ok(b)  =>
+            test.assert(list.len(b) == 4)
+            test.assert((b[1] as Int) == 126)
+            test.assert((b[2] as Int) == 1)
+            test.assert((b[3] as Int) == 44)
+
+    test.case("65536 and up takes eight")
+    match wsframe.encode_header(a_header(BinaryFrame, 65536))
+        Err(_) => test.fail("65536 is a legal length")
+        Ok(b)  =>
+            test.assert(list.len(b) == 10)
+            test.assert((b[1] as Int) == 127)
+            test.assert((b[2] as Int) == 0)
+            test.assert((b[9] as Int) == 0)
+
+    test.case("a masked header carries its four bytes and counts them")
+    let masked = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: TextFrame, masked: true, payload_len: 5,
+        mask_key: Some(a_key()) }
+    test.assert(wsframe.header_len(masked) == 6)
+    match wsframe.encode_header(masked)
+        Err(_) => test.fail("a masked header with a key is encodable")
+        Ok(b)  =>
+            test.assert(list.len(b) == 6)
+            test.assert((b[1] as Int) == 0x85)
+
+    test.case("and a set reserved bit is written back out")
+    let rsv = WsFrameHeader {
+        fin: true, rsv1: true, rsv2: true, rsv3: true,
+        opcode: TextFrame, masked: false, payload_len: 0, mask_key: None }
+    match wsframe.encode_header(rsv)
+        Err(_) => test.fail("encoding writes the bits it was given")
+        Ok(b)  => test.assert((b[0] as Int) == 0xF1)
+
+    test.case("while a mask bit with no key is refused")
+    let bare = WsFrameHeader {
+        fin: true, rsv1: false, rsv2: false, rsv3: false,
+        opcode: TextFrame, masked: true, payload_len: 0, mask_key: None }
+    match wsframe.encode_header(bare)
+        Ok(_)  => test.fail("a masked header without a key cannot be written")
+        Err(e) =>
+            match e
+                BadMaskKey(n) => test.assert(n == 0)
+                _             => test.fail("the refusal names the key length")
+
+@test
+fn test_a_header_decoding_refuses_each_reserved_bit_by_name() [io]
+    test.case("RSV2")
+    // 0xA1 is fin + rsv2 + text.
+    let rsv2 = [0xA1 as u8, 0x00 as u8]
+    match wsframe.decode_header(rsv2, ClientSide)
+        Ok(_)  => test.fail("no extension negotiated RSV2")
+        Err(e) =>
+            match e
+                ReservedBitSet(bit) => test.assert(bit == 2)
+                _                   => test.fail("the refusal names the bit")
+
+    test.case("RSV3")
+    let rsv3 = [0x91 as u8, 0x00 as u8]
+    match wsframe.decode_header(rsv3, ClientSide)
+        Ok(_)  => test.fail("no extension negotiated RSV3")
+        Err(e) =>
+            match e
+                ReservedBitSet(bit) => test.assert(bit == 3)
+                _                   => test.fail("the refusal names the bit")
+
+@test
+fn test_a_length_written_longer_than_it_needed_is_a_protocol_error() [io]
+    test.case("two length bytes for 2")
+    let short16 = [0x82 as u8, 0x7E as u8, 0x00 as u8, 0x02 as u8]
+    match wsframe.decode_header(short16, ClientSide)
+        Ok(_)  => test.fail("2 fits in the seven-bit field")
+        Err(e) =>
+            match e
+                NonMinimalLength(declared, form) =>
+                    test.assert(declared == 2)
+                    test.assert(form == 2)
+                _                                => test.fail("the refusal names the length and the form")
+
+    test.case("eight length bytes for 4")
+    let short64 = [0x82 as u8, 0x7F as u8,
+                   0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                   0x00 as u8, 0x00 as u8, 0x00 as u8, 0x04 as u8]
+    match wsframe.decode_header(short64, ClientSide)
+        Ok(_)  => test.fail("4 fits in the seven-bit field")
+        Err(e) =>
+            match e
+                NonMinimalLength(declared, form) =>
+                    test.assert(declared == 4)
+                    test.assert(form == 8)
+                _                                => test.fail("the refusal names the length and the form")
+
+    test.case("while 65536 in the eight-byte form is the minimal one")
+    let wide = [0x82 as u8, 0x7F as u8,
+                0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8]
+    match wsframe.decode_header(wide, ClientSide)
+        Err(_) => test.fail("65536 is what that form is for")
+        Ok(h)  => test.assert(h.payload_len == 65536)
+
+@test
+fn test_a_header_refuses_a_reserved_opcode_and_an_oversized_control() [io]
+    test.case("0x3 is reserved")
+    match wsframe.decode_header([0x83 as u8, 0x00 as u8], ClientSide)
+        Ok(_)  => test.fail("RFC 6455 assigns no meaning to 0x3")
+        Err(e) =>
+            match e
+                ReservedOpcodeUsed(code) => test.assert(code == 0x3)
+                _                        => test.fail("the refusal names the opcode")
+
+    test.case("a ping of 126 bytes")
+    let big = [0x89 as u8, 0x7E as u8, 0x00 as u8, 0x7E as u8]
+    match wsframe.decode_header(big, ClientSide)
+        Ok(_)  => test.fail("a control frame carries at most 125 bytes")
+        Err(e) =>
+            match e
+                ControlFrameTooLong(n) => test.assert(n == 126)
+                _                      => test.fail("the refusal names the length")
+
+@test
+fn test_an_empty_mask_key_is_no_mask_rather_than_a_refusal() [io]
+    test.case("mask with no key")
+    let plain = [0x48 as u8, 0x69 as u8]
+    let same = wsframe.mask(plain, [])
+    test.assert(list.len(same) == 2)
+    test.assert(same[0] == 'H')
+    test.assert(same[1] == 'i')
+
+@test
+fn test_a_masked_frame_round_trips_through_encode_and_decode() [io]
+    test.case("a client's frame, read by a server")
+    let f = WsFrame {
+        header: WsFrameHeader {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: TextFrame, masked: true, payload_len: 5,
+            mask_key: Some(a_key()) },
+        payload: [0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8] }
+    match wsframe.encode(f)
+        Err(_)    => test.fail("that is a well-formed frame")
+        Ok(bytes) =>
+            test.assert(list.len(bytes) == 11)
+            match wsframe.decode(bytes, ServerSide)
+                Err(_)   => test.fail("what encode wrote, decode reads")
+                Ok(back) =>
+                    test.assert(list.len(back.payload) == 5)
+                    test.assert(back.payload[4] == 'o')
+                    test.assert((back.header.payload_len as Int) == 5)
+
+    test.case("and a server's frame carries no mask")
+    let plain = [0x81 as u8, 0x05 as u8,
+                 0x48 as u8, 0x65 as u8, 0x6C as u8, 0x6C as u8, 0x6F as u8]
+    match wsframe.decode(plain, ClientSide)
+        Err(_)   => test.fail("a server sends unmasked frames")
+        Ok(back) =>
+            test.assert(list.len(back.payload) == 5)
+            test.assert(back.payload[0] == 'H')
+
+    test.case("a mask bit with no key is refused by encode too")
+    let bare = WsFrame {
+        header: WsFrameHeader {
+            fin: true, rsv1: false, rsv2: false, rsv3: false,
+            opcode: TextFrame, masked: true, payload_len: 1, mask_key: None },
+        payload: [0x00 as u8] }
+    match wsframe.encode(bare)
+        Ok(_)  => test.fail("a masked frame carries four key bytes")
+        Err(e) =>
+            match e
+                BadMaskKey(n) => test.assert(n == 0)
+                _             => test.fail("the refusal names the key length")
+
+// ── wsclose ──────────────────────────────────────────────────────────
+
+@test
+fn test_every_assigned_close_code_round_trips_through_its_number() [io]
+    test.case("table")
+    test.assert(wsclose.number_of(MandatoryExtension) == 1010)
+    test.assert(wsclose.number_of(InternalError) == 1011)
+    test.assert(wsclose.number_of(ServiceRestart) == 1012)
+    test.assert(wsclose.number_of(TryAgainLater) == 1013)
+    test.assert(wsclose.number_of(BadGateway) == 1014)
+    test.assert(wsclose.number_of(RegisteredCode(3100)) == 3100)
+    test.assert(wsclose.number_of(PrivateCode(4001)) == 4001)
+
+    test.case("and reading them back")
+    // 1004 is reserved and not assigned, so it is not in this list.
+    let numbers = [1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014]
+    for n in numbers
+        match wsclose.code_of(n)
+            Err(_) => test.fail("every number in that list is assigned")
+            Ok(c)  => test.assert(wsclose.number_of(c) == n)
+
+    test.case("1015 is local like 1005 and 1006")
+    match wsclose.code_of(1015)
+        Ok(_)  => test.fail("1015 is a TLS failure reported to the application")
+        Err(e) =>
+            match e
+                UnsendableCloseCode(code) => test.assert(code == 1015)
+                _                         => test.fail("the refusal names the rule")
+
+    test.case("and 5000 is in none of the ranges")
+    match wsclose.code_of(5000)
+        Ok(_)  => test.fail("3000-4999 is the whole of the open space")
+        Err(e) =>
+            match e
+                UnassignedCloseCode(code) => test.assert(code == 5000)
+                _                         => test.fail("the refusal names the code")
+
+@test
+fn test_every_framing_fault_is_answered_with_1002() [io]
+    test.case("the conversation faults")
+    test.assert(wsclose.number_of(wsclose.close_code_for(ReservedOpcodeUsed(3))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(NonMinimalLength(2, 2))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(ControlFrameTooLong(126))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(FragmentedControlFrame(9))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(MaskedServerFrame)) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(ContinuationWithoutStart)) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(InterleavedDataFrame(1))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(CloseFrameTooShort(1))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(UnsendableCloseCode(1006))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(UnassignedCloseCode(999))) == 1002)
+    test.assert(wsclose.number_of(wsclose.close_code_for(FrameAfterClose(1000))) == 1002)
+
+    test.case("the three payload faults")
+    test.assert(wsclose.number_of(wsclose.close_code_for(BadUtf8InPayload(0))) == 1007)
+    test.assert(wsclose.number_of(wsclose.close_code_for(FrameTooLong(99, 10))) == 1009)
+    test.assert(wsclose.number_of(wsclose.close_code_for(MessageTooLong(99, 10))) == 1009)
+
+@test
+fn test_a_reason_at_the_limit_encodes_and_one_byte_past_it_does_not() [io]
+    test.case("123 bytes")
+    let fits = WsClose { code: NormalClosure, reason: str.repeat("a", 123) }
+    match wsclose.encode_payload(fits)
+        Err(_) => test.fail("125 - 2 = 123 bytes of reason fit")
+        Ok(p)  => test.assert(list.len(p) == 125)
+
+    test.case("124 bytes")
+    let over = WsClose { code: NormalClosure, reason: str.repeat("a", 124) }
+    match wsclose.encode_payload(over)
+        Ok(_)  => test.fail("the code's two bytes come out of the same 125")
+        Err(e) =>
+            match e
+                CloseReasonTooLong(n) => test.assert(n == 124)
+                _                     => test.fail("the refusal names the length")
+
+@test
+fn test_a_reason_survives_the_encoding_as_utf8() [io]
+    test.case("multi-byte text round trips")
+    let c = WsClose { code: PolicyViolation, reason: "café" }
+    match wsclose.encode_payload(c)
+        Err(_) => test.fail("five bytes of text are well inside the limit")
+        Ok(p)  =>
+            match wsclose.decode_payload(p)
+                Err(_)   => test.fail("what encode wrote, decode reads")
+                Ok(back) =>
+                    test.assert(back.reason == "café")
+                    test.assert(wsclose.number_of(back.code) == 1008)
+
+    test.case("and a reason that is not UTF-8 is refused")
+    // 1000, then a lone continuation byte at offset 2.
+    let bad = [0x03 as u8, 0xE8 as u8, 0x80 as u8]
+    match wsclose.decode_payload(bad)
+        Ok(_)  => test.fail("0x80 continues a sequence that never started")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+// Whether a close payload decodes.  Every payload below is written out
+// whole at its call site rather than assembled with `list.concat`: a
+// concat handed straight to `decode_payload` from several calls in one
+// body arrives corrupted, which is a compiler defect and not this
+// package's.
+fn closes(payload: [u8]) -> Bool
+    match wsclose.decode_payload(payload)
+        Ok(_)  => true
+        Err(_) => false
+
+@test
+fn test_a_close_reason_is_checked_one_lead_byte_class_at_a_time() [io]
+    // RFC 3629 confines each lead byte's second byte, and the four
+    // narrowed classes are where an overlong form, a surrogate half or
+    // a value past U+10FFFF is refused.  Each is accepted at its bound
+    // and refused one byte past it.  The payloads are 1000 followed by
+    // the reason.
+    test.case("every class carries its narrowest legal sequence")
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xE0 as u8, 0xA0 as u8, 0x80 as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xE1 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xED as u8, 0x9F as u8, 0xBF as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xEE as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xF0 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xF1 as u8, 0x80 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(closes([0x03 as u8, 0xE8 as u8, 0xF4 as u8, 0x8F as u8, 0xBF as u8, 0xBF as u8]))
+
+    test.case("and one byte past the bound is refused where it starts")
+    let overlong = [0x03 as u8, 0xE8 as u8, 0xE0 as u8, 0x9F as u8, 0x80 as u8]
+    match wsclose.decode_payload(overlong)
+        Ok(_)  => test.fail("0xE0 0x9F 0x80 is U+07FF in a three-byte form")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("a surrogate half")
+    let surrogate = [0x03 as u8, 0xE8 as u8, 0xED as u8, 0xA0 as u8, 0x80 as u8]
+    match wsclose.decode_payload(surrogate)
+        Ok(_)  => test.fail("U+D800 is not a scalar value")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("a four-byte form below its floor")
+    let small = [0x03 as u8, 0xE8 as u8, 0xF0 as u8, 0x8F as u8, 0x80 as u8, 0x80 as u8]
+    match wsclose.decode_payload(small)
+        Ok(_)  => test.fail("0xF0 0x8F 0x80 0x80 is U+FFFF in four bytes")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("a value past U+10FFFF")
+    let past = [0x03 as u8, 0xE8 as u8, 0xF4 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8]
+    match wsclose.decode_payload(past)
+        Ok(_)  => test.fail("U+110000 is past the last scalar value")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("a sequence the payload cuts short")
+    let cut = [0x03 as u8, 0xE8 as u8, 0xE1 as u8, 0x80 as u8]
+    match wsclose.decode_payload(cut)
+        Ok(_)  => test.fail("a three-byte form with two bytes is incomplete")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+    test.case("and a byte that continues nothing")
+    let trailing = [0x03 as u8, 0xE8 as u8, 0xE1 as u8, 0x80 as u8, 0x7F as u8]
+    match wsclose.decode_payload(trailing)
+        Ok(_)  => test.fail("0x7F does not continue a three-byte form")
+        Err(e) =>
+            match e
+                BadUtf8InPayload(at) => test.assert(at == 2)
+                _                    => test.fail("the refusal names the offset")
+
+@test
+fn test_a_peer_that_sends_1005_is_refused_like_one_that_sends_1006() [io]
+    test.case("1005 on the wire")
+    match wsclose.code_of(1005)
+        Ok(_)  => test.fail("1005 is reported locally and never sent")
+        Err(e) =>
+            match e
+                UnsendableCloseCode(code) => test.assert(code == 1005)
+                _                         => test.fail("the refusal names the rule")
+
+// ── wserr ────────────────────────────────────────────────────────────
+
+@test
+fn test_every_decode_refusal_reads_as_one_line() [io]
+    test.case("the decode vocabulary")
+    test.assert(ReservedBitSet(1).message() == "reserved bit 1 is set and no extension negotiated it")
+    test.assert(ReservedOpcodeUsed(5).message() == "opcode 5 is reserved by RFC 6455")
+    test.assert(NonMinimalLength(100, 2).message() == "a length of 100 was written in the 2-byte form")
+    test.assert(ControlFrameTooLong(126).message() == "a control frame carries 126 bytes and 125 is the most it may")
+    test.assert(FragmentedControlFrame(9).message() == "control opcode 9 arrived with fin clear")
+    test.assert(UnmaskedClientFrame.message() == "a client frame arrived unmasked")
+    test.assert(MaskedServerFrame.message() == "a server frame arrived masked")
+    test.assert(FrameTooLong(99, 10).message() == "a frame of 99 bytes is past the limit of 10")
+    test.assert(MessageTooLong(99, 10).message() == "a message of 99 bytes is past the limit of 10")
+    test.assert(ContinuationWithoutStart.message() == "a continuation frame arrived with no message open")
+    test.assert(InterleavedDataFrame(2).message() == "data opcode 2 arrived while a fragmented message was open")
+    test.assert(CloseFrameTooShort(1).message() == "a close frame of 1 bytes is half a code")
+    test.assert(UnsendableCloseCode(1006).message() == "close code 1006 may never appear on a wire")
+    test.assert(UnassignedCloseCode(999).message() == "999 is not a close code RFC 6455 assigns")
+    test.assert(BadUtf8InPayload(3).message() == "byte 3 of the payload is not valid UTF-8")
+    test.assert(FrameAfterClose(1000).message() == "a frame arrived after close code 1000")
+
+@test
+fn test_every_encode_refusal_reads_as_one_line() [io]
+    test.case("the encode vocabulary")
+    test.assert(ControlPayloadTooLong(126).message() == "a control frame carries 126 bytes and 125 is the most it may")
+    test.assert(BadMaskKey(2).message() == "a mask key is four bytes and 2 were given")
+    test.assert(ClientFrameNeedsMask.message() == "a client frame carries a mask key")
+    test.assert(ServerFrameMustNotMask.message() == "a server frame carries no mask key")
+    test.assert(LengthDisagreesWithPayload(99, 1).message() == "the header declares 99 bytes and the payload is 1")
+    test.assert(UnsendableCloseCodeToWrite(1006).message() == "close code 1006 may never appear on a wire")
+    test.assert(CloseReasonTooLong(124).message() == "a close reason of 124 bytes is past the 123 that fit")
+    test.assert(BadFragmentSize(0).message() == "a fragment size of 0 is infinitely many frames")
+    test.assert(NotEnoughMaskKeys(2, 1).message() == "2 frames need 2 mask keys and 1 were given")
+
+@test
+fn test_every_handshake_refusal_reads_as_one_line() [io]
+    test.case("the handshake vocabulary")
+    test.assert(NotAGetAtHttp11.message() == "an upgrade is a GET at HTTP/1.1")
+    test.assert(WrongUpgradeToken("h2c").message() == "the Upgrade field is \"h2c\" and not websocket")
+    test.assert(MissingConnectionUpgrade.message() == "the Connection field does not name Upgrade")
+    test.assert(MissingKey.message() == "no Sec-WebSocket-Key field")
+    test.assert(MalformedKey("nope").message() == "\"nope\" is not the base64 of sixteen bytes")
+    test.assert(UnsupportedVersion(8).message() == "version 8 is not the 13 this package speaks")
+    test.assert(NotSwitchingProtocols(401).message() == "the response is 401 and not 101")
+    test.assert(AcceptMismatch("a", "b").message() == "the accept value is \"b\" and answers \"a\"")
+    test.assert(UnrequestedProtocol("x").message() == "the server chose subprotocol \"x\", which was not offered")
+    test.assert(UnrequestedExtension("y").message() == "the server chose extension \"y\", which was not offered")
+    test.assert(NonceWrongLength(1).message() == "a nonce is sixteen bytes and 1 were given")
+
+@test
+fn test_a_handshake_refusal_has_a_status_exactly_when_the_peer_can_be_told() [io]
+    test.case("the malformed upgrade is a 400")
+    test.assert((wserr.http_status_for(NotAGetAtHttp11) ?? 0) == 400)
+    test.assert((wserr.http_status_for(WrongUpgradeToken("x")) ?? 0) == 400)
+    test.assert((wserr.http_status_for(MissingConnectionUpgrade) ?? 0) == 400)
+    test.assert((wserr.http_status_for(MissingKey) ?? 0) == 400)
+    test.assert((wserr.http_status_for(MalformedKey("x")) ?? 0) == 400)
+
+    test.case("a wrong version is the 426 that names the version")
+    test.assert((wserr.http_status_for(UnsupportedVersion(8)) ?? 0) == 426)
+
+    test.case("and what only a client can reach has nobody to answer")
+    match wserr.http_status_for(NonceWrongLength(1))
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no request to answer")
+    match wserr.http_status_for(NotSwitchingProtocols(401))
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no request to answer")
+    match wserr.http_status_for(AcceptMismatch("a", "b"))
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no request to answer")
+    match wserr.http_status_for(UnrequestedProtocol("x"))
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no request to answer")
+    match wserr.http_status_for(UnrequestedExtension("x"))
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no request to answer")
+
+// ── wshandshake ──────────────────────────────────────────────────────
+
+@test
+fn test_an_upgrade_that_is_not_a_get_at_http11_is_refused() [io]
+    test.case("a POST")
+    let posted = H1Request { method: Post, target: "/chat", version: Http11,
+                             headers: h1msg.headers(upgrade_fields("13")) }
+    match wshandshake.check_upgrade_request(posted)
+        Ok(_)  => test.fail("§ 4.1 requires a GET")
+        Err(e) =>
+            match e
+                NotAGetAtHttp11 => test.assert(true)
+                _               => test.fail("the refusal names the shape")
+
+    test.case("an HTTP/1.0 GET")
+    let old = H1Request { method: Get, target: "/chat", version: Http10,
+                          headers: h1msg.headers(upgrade_fields("13")) }
+    match wshandshake.check_upgrade_request(old)
+        Ok(_)  => test.fail("§ 4.1 requires HTTP/1.1")
+        Err(e) =>
+            match e
+                NotAGetAtHttp11 => test.assert(true)
+                _               => test.fail("the refusal names the shape")
+
+@test
+fn test_each_missing_handshake_field_is_named_on_its_own() [io]
+    test.case("Upgrade: h2c")
+    let wrong = a_get([
+        H1Header { name: "Upgrade", value: "h2c" },
+        H1Header { name: "Connection", value: "Upgrade" },
+        H1Header { name: "Sec-WebSocket-Key", value: the_rfc_client_key() },
+        H1Header { name: "Sec-WebSocket-Version", value: "13" }])
+    match wshandshake.check_upgrade_request(wrong)
+        Ok(_)  => test.fail("h2c is not websocket")
+        Err(e) =>
+            match e
+                WrongUpgradeToken(token) => test.assert(token == "h2c")
+                _                        => test.fail("the refusal quotes the token")
+
+    test.case("Connection: keep-alive")
+    let keepalive = a_get([
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "keep-alive" },
+        H1Header { name: "Sec-WebSocket-Key", value: the_rfc_client_key() },
+        H1Header { name: "Sec-WebSocket-Version", value: "13" }])
+    match wshandshake.check_upgrade_request(keepalive)
+        Ok(_)  => test.fail("the connection must be the upgrade")
+        Err(e) =>
+            match e
+                MissingConnectionUpgrade => test.assert(true)
+                _                        => test.fail("the refusal names the field")
+
+    test.case("no key at all")
+    let keyless = a_get([
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "Upgrade" },
+        H1Header { name: "Sec-WebSocket-Version", value: "13" }])
+    match wshandshake.check_upgrade_request(keyless)
+        Ok(_)  => test.fail("the key is what the accept answers")
+        Err(e) =>
+            match e
+                MissingKey => test.assert(true)
+                _          => test.fail("the refusal names the field")
+
+    test.case("a key that is not the base64 of sixteen bytes")
+    let short = a_get([
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "Upgrade" },
+        H1Header { name: "Sec-WebSocket-Key", value: "dG9vLXNob3J0" },
+        H1Header { name: "Sec-WebSocket-Version", value: "13" }])
+    match wshandshake.check_upgrade_request(short)
+        Ok(_)  => test.fail("ten bytes is not sixteen")
+        Err(e) =>
+            match e
+                MalformedKey(k) => test.assert(k == "dG9vLXNob3J0")
+                _               => test.fail("the refusal quotes the key")
+
+    test.case("a version that is not a number")
+    let unparseable = a_get(upgrade_fields("thirteen"))
+    match wshandshake.check_upgrade_request(unparseable)
+        Ok(_)  => test.fail("thirteen is not the version this package speaks")
+        Err(e) =>
+            match e
+                UnsupportedVersion(v) => test.assert(v == 0)
+                _                     => test.fail("the refusal names the version")
+
+@test
+fn test_the_field_values_a_request_carries_are_read_as_lists() [io]
+    test.case("two copies, one of them a list, and an empty element")
+    let offered = a_get([
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "keep-alive, Upgrade" },
+        H1Header { name: "Sec-WebSocket-Key", value: the_rfc_client_key() },
+        H1Header { name: "Sec-WebSocket-Version", value: "13" },
+        H1Header { name: "Sec-WebSocket-Protocol", value: "chat, superchat" },
+        H1Header { name: "Sec-WebSocket-Protocol", value: " , trailing" },
+        H1Header { name: "Sec-WebSocket-Extensions", value: "permessage-deflate" }])
+    match wshandshake.check_upgrade_request(offered)
+        Err(_) => test.fail("that is a well-formed upgrade")
+        Ok(u)  =>
+            test.assert(u.version == 13)
+            test.assert(list.len(u.protocols) == 3)
+            test.assert(u.protocols[0] == "chat")
+            test.assert(u.protocols[1] == "superchat")
+            test.assert(u.protocols[2] == "trailing")
+            test.assert(list.len(u.extensions) == 1)
+            test.assert(u.extensions[0] == "permessage-deflate")
+
+@test
+fn test_the_client_s_request_writes_the_protocols_it_was_offered() [io]
+    test.case("no protocols is no field")
+    match wshandshake.upgrade_request("server.example.com", "/chat", the_rfc_client_key(), [])
+        Err(_)  => test.fail("the RFC's key is sixteen bytes")
+        Ok(req) =>
+            match h1msg.get(req.headers, "sec-websocket-protocol")
+                None    => test.assert(true)
+                Some(_) => test.fail("an empty offer writes no field")
+
+    test.case("two protocols is one field")
+    match wshandshake.upgrade_request("server.example.com", "/chat", the_rfc_client_key(),
+                                      ["chat", "superchat"])
+        Err(_)  => test.fail("the RFC's key is sixteen bytes")
+        Ok(req) =>
+            match h1msg.get(req.headers, "sec-websocket-protocol")
+                None    => test.fail("the offer is written")
+                Some(v) => test.assert(v == "chat, superchat")
+
+    test.case("and a key that is not sixteen bytes is refused before it is sent")
+    match wshandshake.upgrade_request("server.example.com", "/chat", "too-short", [])
+        Ok(_)  => test.fail("a malformed key is answered with a 400")
+        Err(e) =>
+            match e
+                MalformedKey(k) => test.assert(k == "too-short")
+                _               => test.fail("the refusal quotes the key")
+
+@test
+fn test_the_server_s_101_names_the_subprotocol_it_chose() [io]
+    test.case("a chosen protocol is written")
+    match wshandshake.upgrade_response(the_rfc_client_key(), Some("chat"))
+        Err(_)   => test.fail("the RFC's key is sixteen bytes")
+        Ok(resp) =>
+            match h1msg.get(resp.headers, "sec-websocket-protocol")
+                None    => test.fail("the chosen name is written")
+                Some(v) => test.assert(v == "chat")
+
+    test.case("and no protocol is no field")
+    match wshandshake.upgrade_response(the_rfc_client_key(), None)
+        Err(_)   => test.fail("the RFC's key is sixteen bytes")
+        Ok(resp) =>
+            match h1msg.get(resp.headers, "sec-websocket-protocol")
+                None    => test.assert(true)
+                Some(_) => test.fail("a server that chose none writes none")
+
+    test.case("a bad key is refused")
+    match wshandshake.upgrade_response("too-short", None)
+        Ok(_)  => test.fail("a malformed key is answered with a 400")
+        Err(e) =>
+            match e
+                MalformedKey(_) => test.assert(true)
+                _               => test.fail("the refusal quotes the key")
+
+@test
+fn test_the_client_reads_back_the_answer_to_its_own_key() [io]
+    test.case("a 101 with no subprotocol agrees on none")
+    match wshandshake.check_upgrade_response(the_rfc_client_key(), [], a_101([]))
+        Err(_)  => test.fail("that 101 answers the key that was sent")
+        Ok(got) =>
+            match got
+                None    => test.assert(true)
+                Some(_) => test.fail("no subprotocol was agreed")
+
+    test.case("one that was offered is agreed")
+    let offered = [H1Header { name: "Sec-WebSocket-Protocol", value: "superchat" }]
+    match wshandshake.check_upgrade_response(the_rfc_client_key(), ["chat", "superchat"], a_101(offered))
+        Err(_)  => test.fail("superchat was offered")
+        Ok(got) =>
+            match got
+                None    => test.fail("the server chose superchat")
+                Some(n) => test.assert(n == "superchat")
+
+    test.case("an extension nobody offered is refused")
+    let extended = [H1Header { name: "Sec-WebSocket-Extensions", value: "permessage-deflate" }]
+    match wshandshake.check_upgrade_response(the_rfc_client_key(), [], a_101(extended))
+        Ok(_)  => test.fail("this package negotiates no extensions")
+        Err(e) =>
+            match e
+                UnrequestedExtension(name) => test.assert(name == "permessage-deflate")
+                _                          => test.fail("the refusal names the extension")
+
+// ── wswrite ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_non_four_byte_mask_key_is_refused_by_every_builder() [io]
+    test.case("two bytes")
+    match wswrite.text([0x48 as u8], Some([0x00 as u8, 0x01 as u8]))
+        Ok(_)  => test.fail("a mask key is four bytes")
+        Err(e) =>
+            match e
+                BadMaskKey(n) => test.assert(n == 2)
+                _             => test.fail("the refusal names the length")
+
+    test.case("an empty key is no mask and not a refusal")
+    match wswrite.binary([0x00 as u8], Some([]))
+        Ok(f)  => test.assert(not f.header.masked)
+        Err(_) => test.fail("an empty key is a server's frame")
+
+@test
+fn test_a_control_frame_over_the_limit_is_refused_by_pong_too() [io]
+    test.case("a pong over 125 bytes")
+    let big = list.map(list.range(0, 126), i => 0 as u8)
+    match wswrite.pong(big, None)
+        Ok(_)  => test.fail("a control frame carries at most 125 bytes")
+        Err(e) =>
+            match e
+                ControlPayloadTooLong(n) => test.assert(n == 126)
+                _                        => test.fail("the refusal names the length")
+
+@test
+fn test_both_kinds_of_message_fragment_at_the_size_the_caller_chose() [io]
+    test.case("a text message")
+    let text = frames_of(TextMessage([0x48 as u8, 0x69 as u8, 0x21 as u8]), 2, [])
+    test.assert(list.len(text) == 2)
+    test.assert(text[0].header.opcode == TextFrame)
+    test.assert(not text[0].header.fin)
+    test.assert(text[1].header.opcode == Continuation)
+    test.assert(text[1].header.fin)
+
+    test.case("a binary message")
+    let binary = frames_of(BinaryMessage([0x00 as u8, 0x01 as u8, 0x02 as u8]), 1, [])
+    test.assert(list.len(binary) == 3)
+    test.assert(binary[0].header.opcode == BinaryFrame)
+    test.assert(binary[2].header.fin)
+
+    test.case("a whole message as one buffer")
+    match wswrite.bytes(BinaryMessage([0x00 as u8, 0x01 as u8, 0x02 as u8]), 4096, [])
+        Err(_) => test.fail("three unmasked bytes are a frame")
+        Ok(b)  =>
+            // Two fixed bytes of header and three of payload.
+            test.assert(list.len(b) == 5)
+            test.assert((b[0] as Int) == 0x82)
+
+// ── wsread ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_fragmented_text_message_reassembles_across_feeds() [io]
+    test.case("two fragments, then the message")
+    let frames = frames_of(TextMessage([0x48 as u8, 0x69 as u8]), 1, [a_key(), a_key()])
+    test.assert(list.len(frames) == 2)
+    let first = wire_of(frames[0])
+    let second = wire_of(frames[1])
+    test.assert(list.len(first) > 0)
+    test.assert(list.len(second) > 0)
+
+    match wsread.feed(a_server_reader(), first)
+        Err(_)   => test.fail("a masked fragment is what a server reads")
+        Ok(step) =>
+            match step.event
+                None     => test.fail("a whole fragment is an event")
+                Some(ev) =>
+                    match ev
+                        DataFrame(_) => test.assert(true)
+                        _            => test.fail("the fragment arrives as a fragment")
+            test.assert(wsread.message_open(step.reader))
+            test.assert(wsread.assembling_len(step.reader) == 1)
+            match wsread.feed(step.reader, second)
+                Err(_)          => test.fail("the continuation is legal while a message is open")
+                Ok(second_step) =>
+                    let whole = wsread.take(second_step.reader)
+                    match whole
+                        Err(_)    => test.fail("the message is owed by the fin fragment")
+                        Ok(step2) =>
+                            match step2.event
+                                None      => test.fail("a fin fragment completes the message")
+                                Some(ev2) =>
+                                    match ev2
+                                        DataMessage(m) =>
+                                            match m
+                                                TextMessage(utf8) => test.assert(list.len(utf8) == 2)
+                                                BinaryMessage(_)  => test.fail("a text frame owes a text message")
+                                        _              => test.fail("the message follows the fragments")
+                            test.assert(not wsread.message_open(step2.reader))
+
+@test
+fn test_a_binary_message_is_reported_as_binary() [io]
+    test.case("one fin binary frame")
+    let frames = frames_of(BinaryMessage([0x00 as u8]), 4096, [a_key()])
+    test.assert(list.len(frames) == 1)
+    let wire_bytes = wire_of(frames[0])
+    test.assert(list.len(wire_bytes) > 0)
+    match wsread.feed(a_server_reader(), wire_bytes)
+        Err(_)   => test.fail("a masked binary frame is what a server reads")
+        Ok(step) =>
+            match wsread.take(step.reader)
+                Err(_)   => test.fail("the fin frame owes a message")
+                Ok(next) =>
+                    match next.event
+                        None     => test.fail("the message is owed")
+                        Some(ev) =>
+                            match ev
+                                DataMessage(m) =>
+                                    match m
+                                        BinaryMessage(data) => test.assert(list.len(data) == 1)
+                                        TextMessage(_)      => test.fail("a binary frame owes a binary message")
+                                _              => test.fail("the message follows the frame")
+
+@test
+fn test_the_frame_rules_that_need_the_sequence_are_refused_by_the_reader() [io]
+    test.case("a data frame inside a fragmented message")
+    let fragment = wire_of(frames_of(TextMessage([0x48 as u8, 0x69 as u8]), 1, [a_key(), a_key()])[0])
+    let other = wire_of(frames_of(BinaryMessage([0x00 as u8]), 4096, [a_key()])[0])
+    match wsread.feed(a_server_reader(), fragment)
+        Err(_)   => test.fail("a non-fin fragment opens a message")
+        Ok(step) =>
+            match wsread.feed(step.reader, other)
+                Ok(_)  => test.fail("§ 5.4 forbids a second data frame there")
+                Err(e) =>
+                    match e
+                        InterleavedDataFrame(code) => test.assert(code == 0x2)
+                        _                          => test.fail("the refusal names the opcode")
+
+    test.case("a continuation with no message open")
+    let continuation = wire_of(frames_of(BinaryMessage([0x00 as u8]), 1, [a_key()])[0])
+    let lone = match wswrite.continuation([0x01 as u8], false, Some(a_key()))
+        Ok(f)  => wire_of(f)
+        Err(_) => []
+    test.assert(list.len(lone) > 0)
+    match wsread.feed(a_server_reader(), lone)
+        Ok(_)  => test.fail("a continuation starts nothing")
+        Err(e) =>
+            match e
+                ContinuationWithoutStart => test.assert(true)
+                _                        => test.fail("the refusal names the rule")
+
+@test
+fn test_a_ping_and_a_pong_are_events_the_message_state_survives() [io]
+    test.case("a ping between the fragments")
+    let frames = frames_of(TextMessage([0x48 as u8, 0x69 as u8]), 1, [a_key(), a_key()])
+    let first = wire_of(frames[0])
+    let second = wire_of(frames[1])
+    let ping = match wswrite.ping([0x01 as u8], Some(a_key()))
+        Ok(f)  => wire_of(f)
+        Err(_) => []
+    let pong = match wswrite.pong([0x01 as u8], Some(a_key()))
+        Ok(f)  => wire_of(f)
+        Err(_) => []
+    test.assert(list.len(ping) > 0)
+    test.assert(list.len(pong) > 0)
+
+    match wsread.feed(a_server_reader(), first)
+        Err(_)   => test.fail("a non-fin fragment opens a message")
+        Ok(step) =>
+            match wsread.feed(step.reader, ping)
+                Err(_)     => test.fail("a control frame is legal between fragments")
+                Ok(pinged) =>
+                    match pinged.event
+                        None     => test.fail("a whole ping is an event")
+                        Some(ev) =>
+                            match ev
+                                ControlPing(payload) => test.assert(list.len(payload) == 1)
+                                _                    => test.fail("the ping arrives as a ping")
+                    test.assert(wsread.message_open(pinged.reader))
+                    match wsread.feed(pinged.reader, pong)
+                        Err(_)     => test.fail("a pong is legal there too")
+                        Ok(ponged) =>
+                            match ponged.event
+                                None      => test.fail("a whole pong is an event")
+                                Some(ev2) =>
+                                    match ev2
+                                        ControlPong(_) => test.assert(true)
+                                        _              => test.fail("the pong arrives as a pong")
+                            // The message is still open and the next
+                            // fragment still completes it.
+                            match wsread.feed(ponged.reader, second)
+                                Err(_)   => test.fail("the continuation is still legal")
+                                Ok(done) => test.assert(not wsread.message_open(done.reader))
+
+@test
+fn test_a_peer_close_ends_the_reader_and_nothing_follows_it() [io]
+    test.case("a close frame with a code and a reason")
+    let frame = match wswrite.close_frame(WsClose { code: NormalClosure, reason: "bye" }, Some(a_key()))
+        Ok(f)  => wire_of(f)
+        Err(_) => []
+    test.assert(list.len(frame) > 0)
+    match wsread.feed(a_server_reader(), frame)
+        Err(_)   => test.fail("1000 with a short reason is an ordinary close")
+        Ok(step) =>
+            match step.event
+                None     => test.fail("a whole close frame is an event")
+                Some(ev) =>
+                    match ev
+                        PeerClose(c) =>
+                            test.assert(wsclose.number_of(c.code) == 1000)
+                            test.assert(c.reason == "bye")
+                        _            => test.fail("the close arrives as a close")
+            test.assert(wsread.closed(step.reader))
+            match wsread.feed(step.reader, masked_hello())
+                Ok(_)  => test.fail("nothing legal follows a close frame")
+                Err(e) =>
+                    match e
+                        FrameAfterClose(code) => test.assert(code == 1000)
+                        _                     => test.fail("the refusal names the close code")
+
+@test
+fn test_an_incomplete_length_field_is_kept_rather_than_refused() [io]
+    test.case("two bytes of a 16-bit length")
+    let two = [0x82 as u8, 0x7E as u8]
+    match wsread.feed(a_server_reader(), two)
+        Err(_)   => test.fail("a partial length is not a fault")
+        Ok(step) =>
+            test.assert(not wsread.closed(step.reader))
+            match step.event
+                None    => test.assert(true)
+                Some(_) => test.fail("no frame is complete yet")
+            test.assert(wsread.pending_len(step.reader) == 2)
+
+    test.case("eight length bytes with the top bit set never complete")
+    let impossible = [0x82 as u8, 0xFF as u8, 0x80 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x00 as u8]
+    match wsread.feed(a_server_reader(), impossible)
+        Err(_)   => test.fail("a length that can never arrive is not a fault yet")
+        Ok(step) =>
+            match step.event
+                None    => test.assert(true)
+                Some(_) => test.fail("no frame is complete")
+
+    test.case("a length the frame limit refuses on arrival")
+    let declared = [0x82 as u8, 0x7F as u8,
+                    0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                    0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8]
+    let tiny = WsLimits { max_frame: 1024, max_message: 1024 }
+    match wsread.feed(wsread.reader(ServerSide, tiny), declared)
+        Ok(_)  => test.fail("65536 bytes is past a cap of 1024")
+        Err(e) =>
+            match e
+                FrameTooLong(len, cap) =>
+                    test.assert(len == 65536)
+                    test.assert(cap == 1024)
+                _                      => test.fail("the refusal names the length and the cap")
+
+@test
+fn test_a_message_past_the_limit_is_refused_and_the_reader_never_grows() [io]
+    test.case("two fragments past max_message")
+    let limits = WsLimits { max_frame: 1024, max_message: 3 }
+    let frames = frames_of(BinaryMessage([0x00 as u8, 0x01 as u8, 0x02 as u8, 0x03 as u8]), 2, [a_key(), a_key()])
+    test.assert(list.len(frames) == 2)
+    let first = wire_of(frames[0])
+    let second = wire_of(frames[1])
+    test.assert(list.len(first) > 0)
+    test.assert(list.len(second) > 0)
+    match wsread.feed(wsread.reader(ServerSide, limits), first)
+        Err(_)   => test.fail("two bytes are inside a cap of three")
+        Ok(step) =>
+            match wsread.feed(step.reader, second)
+                Ok(_)  => test.fail("four bytes are past a cap of three")
+                Err(e) =>
+                    match e
+                        MessageTooLong(len, cap) =>
+                            test.assert(len == 4)
+                            test.assert(cap == 3)
+                        _                        => test.fail("the refusal names the length and the cap")
+
+@test
+fn test_utf8_is_checked_at_every_kind_of_sequence() [io]
+    test.case("one byte")
+    test.assert(wsread.is_valid_utf8([0x00 as u8]))
+    test.assert(wsread.is_valid_utf8([0x7F as u8]))
+
+    test.case("two bytes")
+    test.assert(wsread.is_valid_utf8([0xC2 as u8, 0x80 as u8]))
+    test.assert(not wsread.is_valid_utf8([0xC1 as u8, 0x80 as u8]))
+    test.assert(not wsread.is_valid_utf8([0xC2 as u8, 0x7F as u8]))
+
+    test.case("three bytes, including the two narrow lead bytes")
+    test.assert(wsread.is_valid_utf8([0xE0 as u8, 0xA0 as u8, 0x80 as u8]))
+    test.assert(not wsread.is_valid_utf8([0xE0 as u8, 0x9F as u8, 0x80 as u8]))
+    test.assert(wsread.is_valid_utf8([0xE1 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(wsread.is_valid_utf8([0xED as u8, 0x9F as u8, 0xBF as u8]))
+    test.assert(not wsread.is_valid_utf8([0xED as u8, 0xA0 as u8, 0x80 as u8]))
+    test.assert(wsread.is_valid_utf8([0xEF as u8, 0xBF as u8, 0xBF as u8]))
+    test.assert(not wsread.is_valid_utf8([0xE1 as u8, 0x80 as u8, 0x7F as u8]))
+
+    test.case("four bytes, including the last lead byte")
+    test.assert(wsread.is_valid_utf8([0xF0 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(not wsread.is_valid_utf8([0xF0 as u8, 0x8F as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(wsread.is_valid_utf8([0xF1 as u8, 0x80 as u8, 0x80 as u8, 0x80 as u8]))
+    test.assert(wsread.is_valid_utf8([0xF4 as u8, 0x8F as u8, 0xBF as u8, 0xBF as u8]))
+    test.assert(not wsread.is_valid_utf8([0xF4 as u8, 0x90 as u8, 0x80 as u8, 0x80 as u8]))
+
+    test.case("a sequence the buffer cuts short")
+    test.assert(not wsread.is_valid_utf8([0xE1 as u8, 0x80 as u8]))
+
+    test.case("and a byte that leads nothing")
+    test.assert(not wsread.is_valid_utf8([0xF5 as u8]))
+    test.assert(not wsread.is_valid_utf8([0xFF as u8]))
+
+// ── wsread.drain ─────────────────────────────────────────────────────
+
+// A source that fails instead of running out: the one answer `drain`
+// has to tell apart from an exhausted stream, and the only one no
+// in-memory buffer gives.
+struct BrokenSource
+    reads: Int
+
+impl Read[] for BrokenSource
+    fn read(self, n: Int) -> Result<Bytes, IoError>
+        let _ = n
+        Err(IoOther("the transport went away"))
+
+@test
+fn test_two_frames_in_one_chunk_leave_the_second_where_it_landed() [io]
+    test.case("both frames in one feed")
+    let both = list.concat(masked_hello(), masked_hello())
+    match wsread.feed(a_server_reader(), both)
+        Err(_)   => test.fail("the first frame is whole inside that chunk")
+        Ok(step) =>
+            match step.event
+                None     => test.fail("the first frame is whole")
+                Some(ev) =>
+                    match ev
+                        DataFrame(_) => test.assert(true)
+                        _            => test.fail("a data frame arrives first")
+            // The second frame is held whole and unread: eleven bytes.
+            test.assert(wsread.pending_len(step.reader) == 11)
+            match wsread.take(step.reader)
+                Err(_)  => test.fail("the first frame owes a message")
+                Ok(msg) =>
+                    match msg.event
+                        None      => test.fail("the message is owed")
+                        Some(ev2) =>
+                            match ev2
+                                DataMessage(_) => test.assert(true)
+                                _              => test.fail("the message follows its frame")
+                    // And the held frame is still there to be read.
+                    match wsread.take(msg.reader)
+                        Err(_)     => test.fail("the second frame is whole and held")
+                        Ok(second) =>
+                            match second.event
+                                None      => test.fail("the second frame is whole")
+                                Some(ev3) =>
+                                    match ev3
+                                        DataFrame(_) => test.assert(true)
+                                        _            => test.fail("the frame is next, before its message")
+
+@test
+fn test_the_declared_length_is_read_before_the_body_is_asked_for() [io]
+    // `frame_step` asks the length field for its size before it asks the
+    // buffer whether the frame is whole, which is what refuses a
+    // declared gigabyte before the gigabyte arrives.
+    test.case("four bytes of a 16-bit length")
+    let four = [0x82 as u8, 0x7E as u8, 0x00 as u8, 0x02 as u8]
+    match wsread.feed(a_server_reader(), four)
+        Err(_)   => test.fail("two bytes is a legal declared length")
+        Ok(step) =>
+            test.assert(not wsread.closed(step.reader))
+            match step.event
+                None    => test.assert(true)
+                Some(_) => test.fail("the body has not arrived")
+
+    test.case("three bytes of a 64-bit length")
+    let three = [0x82 as u8, 0x7F as u8, 0x00 as u8]
+    match wsread.feed(a_server_reader(), three)
+        Err(_)   => test.fail("a length that has not arrived is not a fault")
+        Ok(step) =>
+            match step.event
+                None    => test.assert(true)
+                Some(_) => test.fail("the length field is incomplete")
+
+@test
+fn test_drain_holds_a_prefix_that_never_completes() [io]
+    test.case("a source that ends one byte into a frame")
+    // Where the frame is not a fault and not an event: the byte stays
+    // held for whoever continues the stream.
+    let src = Buffer.from_str("\x81")
+    match wsread.drain(a_server_reader(), src)
+        Err(_) => test.fail("an exhausted source is not a fault")
+        Ok(d)  =>
+            test.assert(list.len(d.events) == 0)
+            test.assert(wsread.pending_len(d.reader) == 1)
+            test.assert(not wsread.closed(d.reader))
+    src.drop()
+
+@test
+fn test_drain_reports_every_event_a_source_holds() [io]
+    test.case("a whole masked message in one buffer")
+    // The RFC's example frame as the bytes a client would have sent.
+    let src = Buffer.from_str("\x81\x85\x37\xFA\x21\x3D\x7F\x9F\x4D\x51\x58")
+    match wsread.drain(a_server_reader(), src)
+        Err(_) => test.fail("that is a whole masked text message")
+        Ok(d)  =>
+            test.assert(list.len(d.events) == 2)
+            test.assert(wsread.pending_len(d.reader) == 0)
+            test.assert(wsread.assembling_len(d.reader) == 0)
+    src.drop()
+
+@test
+fn test_drain_ends_at_a_transport_failure_with_what_it_has() [io]
+    test.case("a source whose read fails")
+    match wsread.drain(a_server_reader(), BrokenSource { reads: 0 })
+        Err(_) => test.fail("a failed transport is not a decode fault")
+        Ok(d)  =>
+            test.assert(list.len(d.events) == 0)
+            test.assert(not wsread.closed(d.reader))

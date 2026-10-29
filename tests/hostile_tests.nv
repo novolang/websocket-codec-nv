@@ -1,0 +1,33 @@
+// hostile_tests.nv — frame headers that declare more payload than an Int can count.
+
+use std.test
+use std.list
+use wsframe
+
+// A binary frame header with the 8-byte length form and the length bytes `len_hex`.
+fn header_with_length(masked: Bool, len_hex: [Int]) -> [u8]
+    let head: [u8] = [0x82 as u8, (if masked then 0xFF else 0x7F) as u8]
+    list.concat(head, list.map(len_hex, b => b as u8))
+
+fn is_need_more(buf: [u8]) -> Bool
+    match wsframe.scan(buf)
+        NeedMore    => true
+        Complete(_) => false
+
+@test
+fn test_the_largest_declared_length_needs_more() [io]
+    let big = [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    test.assert(is_need_more(header_with_length(false, big)))
+    test.assert(is_need_more(header_with_length(true, big)))
+
+@test
+fn test_a_length_near_the_largest_needs_more() [io]
+    let near = [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8]
+    test.assert(is_need_more(header_with_length(false, near)))
+    test.assert(is_need_more(header_with_length(true, near)))
+
+@test
+fn test_an_honest_frame_still_scans() [io]
+    match wsframe.scan([0x82 as u8, 0x02 as u8, 0x01 as u8, 0x02 as u8])
+        Complete(n) => test.assert_eq(n, 4)
+        NeedMore    => test.assert(false)
