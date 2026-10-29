@@ -4,6 +4,46 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-10-29
+
+The first implementation of the interface published as 0.0.1: the frame
+arithmetic, the close codes, the reader and writer and the opening
+handshake.
+
+### Added
+
+- Every function has a body. A frame is written in the shortest length
+  form and read only in that form, the mask is applied with the key the
+  caller supplies, and a reader reassembles fragmented messages between
+  control frames, enforces the frame and message limits on the header,
+  and checks that a text message and a close reason are UTF-8.
+- `wsframe.read_length` reads the length a header declares from a buffer
+  that may hold only part of it, and `wsframe.utf8_fault` gives the
+  offset of the first malformed byte of a UTF-8 string. `wsread` and
+  `wsclose` use them, and they are public so a caller that streams with
+  `max_message: 0` can check text itself.
+- `WsLengthField`, the answer of `read_length`.
+- `WsDecodeError` has a variant, `TruncatedFrame`, for a buffer that
+  ends inside a header or before the end of the frame it declares. A
+  reader never returns it, because it waits for the rest of a frame.
+- `tests/differential_tests.nv`, written by `tools/differential.py`,
+  checks the package against Node 22's WebSocket client, Python's
+  `hashlib`, `base64` and UTF-8 codec, and a frame writer in the script.
+  `bash tests/coverage.sh` prints the line coverage of `src/`.
+
+### Changed
+
+These break code written against 0.0.x.
+
+- `WsReader` is a value that changes in place. Its list and counter
+  fields are `var`, and it has three more fields: `open`, `owed` and
+  `peer_close`. `feed` and `take` write onto the reader they are given
+  and return it in the step; the reader passed in must not be used
+  again. A reader is made with `wsread.reader`.
+- The README and the manifest no longer say the package is interface
+  only. The stability is `experimental`.
+- `novo` is `>= 0.20.2`.
+
 ## 0.0.6 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A

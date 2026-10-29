@@ -12,12 +12,6 @@ HTTP/1.1 exchange, so
 [http-codec-nv](https://novo-lang.org/packages/http-codec-nv) supplies
 the request and response types it is spelled in.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a WebSocket frame is
 
 A WebSocket connection begins as an ordinary HTTP/1.1 request that asks
@@ -165,16 +159,13 @@ fn report(ev: WsEvent) [io]
         PeerClose(c)   => println("closing with ${wsclose.number_of(c.code)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented:
-websocket-codec-nv.<module>.<fn>` panic. The tests are the specification
-the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
-| `wsframe` | The frame as a type. The opcodes, the role, the header, encoding and decoding one frame, the masking function, and `scan`, which reads only the length field. |
+| `wsframe` | The frame as a type. The opcodes, the role, the header, encoding and decoding one frame, the masking function, `read_length` and `scan`, which read only the length field, and `utf8_fault`, which finds the first malformed byte of a UTF-8 string. |
 | `wsclose` | The close handshake's status code as a typed value: the sixteen assigned numbers, the two open ranges, the rule about which may be sent, and a close payload to and from bytes. |
 | `wshandshake` | The opening handshake as a computation. The accept key, the client key, and the functions that build and check the HTTP/1.1 request and response. |
 | `wsread` | A reader that takes bytes as they arrive, removes the mask, reassembles fragmented messages and hands back one event at a time. |
@@ -200,7 +191,10 @@ yourself.
 reassembles a fragmented message and reports pings and closes as their
 own events. Use it in any endpoint that reads from a socket, because a
 socket hands over whatever arrived rather than whole frames. Feed it
-with `feed`, then call `take` until the event is `None`.
+with `feed`, then call `take` until the event is `None`. A reader is a
+value that changes in place: `feed` and `take` write onto the reader
+they are given and hand it back in the step, so keep the one in the
+step and do not use the one you passed in afterwards.
 
 `wsread.drain` is that loop written once, over any source that
 implements the standard library's `Read` trait. It is the only function
@@ -271,7 +265,13 @@ separately.
     and a fragmented message may be extended forever with one-byte
     continuations, so `WsLimits` caps both. Setting `max_message` to
     zero turns reassembly off, and the reader then reports every
-    fragment and never a whole message.
+    fragment and never a whole message. With reassembly off the reader
+    cannot check that a text message is valid UTF-8, because a
+    character can be split between two fragments, so a caller that
+    streams checks the text itself with `wsframe.utf8_fault`. A header
+    whose 64-bit length has its top bit set, which no Int counts, is
+    held like any other prefix until more than a header's worth of bytes
+    has arrived, and then it is `FrameTooLong`.
 14. **The accept value in the server's 101 must be checked**
     (section 4.1). It is what stops a cache from replaying an unrelated
     101 at a client. `wshandshake.check_upgrade_response` checks it
@@ -279,26 +279,12 @@ separately.
 
 ## Running on a microcontroller
 
-novo-lang lets a package state which of its modules can run on a device
-with no heap allocator, and the compiler checks that claim on every
-build. Here the claim covers the whole package. Every function is
-arithmetic over bytes the caller supplies, and the reader's state is a
-value the caller owns rather than a buffer this package hides.
-
-```bash
-novo build --target=nrf52-qemu src/main.nv
-```
-
-`wsread.embedded_limits` is the limit set for that case: a frame of 1
-KiB and a message of 4 KiB, against the 16 MiB and 64 MiB of
-`wsread.default_limits`. The number that matters on a device is the one
-that fits beside everything else in 64 KiB of RAM.
-
-This release ships no device probe program. A probe would have to name
-the package's own `Result` types, and a `Result` whose error type is
-declared in the package cannot be spelled in a module built for a device
-with this toolchain. The signatures keep their `Result`, and the probe
-arrives with the toolchain fix.
+This release makes no device claim. `wshandshake`, `wsclose` and
+`wsread.drain` call `std.bytes`, which the embedded tier does not offer,
+and every module returns lists, which need a heap. `wsread.embedded_limits`
+is the smaller limit set, a frame of 1 KiB and a message of 4 KiB
+against the 16 MiB and 64 MiB of `wsread.default_limits`, for a caller
+that runs the reader on a target that has a heap.
 
 ## What is not included
 
@@ -357,59 +343,37 @@ arrives with the toolchain fix.
 ## Tests
 
 ```bash
-novo test tests/wsframe_tests.nv       # the frame arithmetic
-novo test tests/wsclose_tests.nv       # the close codes
-novo test tests/wshandshake_tests.nv   # the upgrade exchange
-novo test tests/wsread_tests.nv        # the reader and the writer
+novo test                              # every suite
+bash tests/coverage.sh                 # the line coverage of src/, merged
+python3 tools/differential.py          # rewrite tests/differential_tests.nv
 ```
 
-The byte strings the suite asserts against are RFC 6455's own. Section
-5.7 prints a masked single-frame text message and its unmasked
-counterpart, and both are here. Section 1.3 prints an example nonce, the
-key it produces and the accept value that answers it, and that is the
-vector `wshandshake` is checked against. The Autobahn Testsuite is the
-oracle the finished implementation will be measured against.
+The byte strings the suites assert against come from three places.
+RFC 6455 prints a masked single-frame text message and its unmasked
+counterpart in section 5.7, and an example nonce, the key it produces
+and the accept value that answers it in section 1.3. Both are here.
 
-The suite checks that an opcode and its four bits round trip, that a
-frame survives encoding and decoding, that the mask is its own inverse,
-that a server refuses an unmasked client frame and a client refuses a
-masked server frame, that every close code round trips, that the three
-local codes cannot be put in a frame, and that a whole frame arrives
-from the reader as a fragment event and then as a message event.
+`tests/differential_tests.nv` is written by `tools/differential.py` from
+independent implementations. The script runs Node 22's built-in
+WebSocket client against a small server. The server sends it a stream of
+frames, which has fragments, a ping between them, an empty text message
+and a text message of 70000 bytes, and the client accepts the stream,
+checks the accept value and the UTF-8, and sends frames back with masks
+of its own. The suite reads the stream the client accepted and the
+frames the client sent, whole and in pieces of one byte. Python's
+`hashlib` and `base64` give 40 client keys and accept values, and its
+strict UTF-8 codec gives the verdict and the offset of the first
+malformed byte for 234 strings. A frame writer in the script, written
+from section 5.2 of the RFC, gives 70 frames and 30 fragmented messages
+that this package writes byte for byte and reads back.
 
 `tests/wsread_tests.nv` also asserts something the compiler settles
 before the run starts. `drain` over an in-memory buffer costs no
 effects. Had `drain` spent an effect rather than binding the caller's,
 that file would not compile.
 
-The tests compile today and fail at run, each on the `not implemented:
-websocket-codec-nv.<module>.<fn>` panic that is its body. That is the
-expected state of an interface release. They turn green one at a time as
-bodies land.
-
-## Implementation status
-
-Every type, every enum variant and every declared effect is published
-in full.
-This table is about the function bodies.
-
-| Item | Implemented |
-| --- | --- |
-| `wsframe.CONTROL_PAYLOAD_MAX`, `.MASK_KEY_LEN` | yes (they are constants) |
-| `wsclose.CLOSE_REASON_MAX` | yes (it is a constant) |
-| `wshandshake.WS_GUID`, `.WS_VERSION`, `.NONCE_LEN` | yes (they are constants) |
-| `wsframe.opcode_number`, `.opcode_of`, `.is_control`, `.header_len`, `.minimal_length_form` | no |
-| `wsframe.scan`, `.encode_header`, `.decode_header`, `.mask`, `.encode`, `.decode` | no |
-| `wsclose.number_of`, `.code_of`, `.is_sendable`, `.close_code_for`, `.encode_payload`, `.decode_payload` | no |
-| `wshandshake.accept_key`, `.client_key`, `.is_valid_key` | no |
-| `wshandshake.upgrade_request`, `.check_upgrade_request`, `.upgrade_response`, `.check_upgrade_response` | no |
-| `wshandshake.version_refusal`, `.is_websocket_upgrade` | no |
-| `wsread.default_limits`, `.embedded_limits`, `.reader`, `.feed`, `.take` | no |
-| `wsread.pending_len`, `.assembling_len`, `.message_open`, `.closed`, `.is_valid_utf8` | no |
-| `wsread.drain` | no |
-| `wswrite.frame_count`, `.message_frames`, `.bytes` | no |
-| `wswrite.text`, `.binary`, `.ping`, `.pong`, `.close_frame`, `.continuation`, `.fail_connection` | no |
-| `wserr.http_status_for` and the three `message` implementations | no |
+Every line under `src/` is run by the suites, and the strict shard audit
+passes.
 
 ## Licence
 

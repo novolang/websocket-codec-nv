@@ -1,15 +1,10 @@
 [package]
 name        = "websocket-codec-nv"
-version     = "0.0.6"
-description = "The WebSocket frame arithmetic with no socket under it: frame headers to and from bytes, the mask, fragmentation and reassembly, the control-frame constraints, close codes as a typed value, and the RFC 6455 handshake as a pure computation the host performs the exchange for.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The WebSocket frame arithmetic with no socket under it: frame headers to and from bytes, the mask, fragmentation and reassembly, the control-frame constraints, close codes as a typed value, and the RFC 6455 handshake as a pure computation the host performs the exchange for."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`: frames in, frames out, and no connection.  The two things a
 # WebSocket endpoint needs from the machine — a random 16-byte nonce for
@@ -25,7 +20,7 @@ category    = "networking"
 tags        = ["websocket", "rfc6455", "framing", "handshake", "codec", "sans-io", "masking", "fragmentation"]
 repository  = "https://github.com/novolang/websocket-codec-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 [docs.pages]
 "README.md" = "WebSocket frames, without a socket"
