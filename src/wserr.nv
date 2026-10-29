@@ -1,8 +1,6 @@
 // wserr.nv — every way a WebSocket connection can go wrong, in three
 // types because there are three different audiences.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY THREE
 //
 // `WsDecodeError` is "the peer sent a frame RFC 6455 does not allow",
@@ -81,6 +79,10 @@ pub enum WsDecodeError
     BadUtf8InPayload(at: Int)
     // A frame arrived after a close frame was received.
     FrameAfterClose(code: Int)
+    // A buffer holds fewer bytes than the frame at its front declares,
+    // or fewer than its header needs.  `decode_header` and `decode` take
+    // a buffer `scan` has called whole; a reader never reaches this.
+    TruncatedFrame(have: Int)
 
 // message renders the refusal as one line of prose.
 //
@@ -88,7 +90,24 @@ pub enum WsDecodeError
 // error type only if it implements `Error`.
 impl Error for WsDecodeError
     fn message(self) -> Str
-        todo("websocket-codec-nv.wserr.WsDecodeError.message")
+        match self
+            ReservedBitSet(bit)              => "reserved bit ${bit} is set and no extension negotiated it"
+            ReservedOpcodeUsed(code)         => "opcode ${code} is reserved by RFC 6455"
+            NonMinimalLength(declared, form) => "a length of ${declared} was written in the ${form}-byte form"
+            ControlFrameTooLong(len)         => "a control frame carries ${len} bytes and 125 is the most it may"
+            FragmentedControlFrame(code)     => "control opcode ${code} arrived with fin clear"
+            UnmaskedClientFrame              => "a client frame arrived unmasked"
+            MaskedServerFrame                => "a server frame arrived masked"
+            FrameTooLong(len, cap)           => "a frame of ${len} bytes is past the limit of ${cap}"
+            MessageTooLong(len, cap)         => "a message of ${len} bytes is past the limit of ${cap}"
+            ContinuationWithoutStart         => "a continuation frame arrived with no message open"
+            InterleavedDataFrame(code)       => "data opcode ${code} arrived while a fragmented message was open"
+            CloseFrameTooShort(len)          => "a close frame of ${len} bytes is half a code"
+            UnsendableCloseCode(code)        => "close code ${code} may never appear on a wire"
+            UnassignedCloseCode(code)        => "${code} is not a close code RFC 6455 assigns"
+            BadUtf8InPayload(at)             => "byte ${at} of the payload is not valid UTF-8"
+            FrameAfterClose(code)            => "a frame arrived after close code ${code}"
+            TruncatedFrame(have)             => "${have} bytes are fewer than the frame needs"
 
 // WsEncodeError is why a frame this package was asked to write would
 // not have been a legal WebSocket frame.
@@ -100,9 +119,12 @@ pub enum WsEncodeError
     // A client frame with no mask key.  Not the same as `BadMaskKey`:
     // this one is the caller having forgotten that masking is
     // mandatory from a client, and the fix is to supply four random
-    // bytes rather than to fix the four it supplied.
+    // bytes rather than to fix the four it supplied.  The writer does
+    // not know its role, so none of its functions returns this; it is
+    // here for the host that does.
     ClientFrameNeedsMask
-    // A server frame carrying a mask key, which the RFC forbids.
+    // A server frame carrying a mask key, which the RFC forbids.  Like
+    // `ClientFrameNeedsMask`, it is for the host to return.
     ServerFrameMustNotMask
     // A header whose `payload_len` disagrees with the payload handed
     // over.  A frame that lied about its own length is the one thing a
@@ -124,7 +146,16 @@ pub enum WsEncodeError
 // message renders the refusal as one line of prose.
 impl Error for WsEncodeError
     fn message(self) -> Str
-        todo("websocket-codec-nv.wserr.WsEncodeError.message")
+        match self
+            ControlPayloadTooLong(len)                   => "a control frame carries ${len} bytes and 125 is the most it may"
+            BadMaskKey(len)                              => "a mask key is four bytes and ${len} were given"
+            ClientFrameNeedsMask                         => "a client frame carries a mask key"
+            ServerFrameMustNotMask                       => "a server frame carries no mask key"
+            LengthDisagreesWithPayload(declared, actual) => "the header declares ${declared} bytes and the payload is ${actual}"
+            UnsendableCloseCodeToWrite(code)             => "close code ${code} may never appear on a wire"
+            CloseReasonTooLong(len)                      => "a close reason of ${len} bytes is past the 123 that fit"
+            BadFragmentSize(size)                        => "a fragment size of ${size} is infinitely many frames"
+            NotEnoughMaskKeys(want, got)                 => "${want} frames need ${want} mask keys and ${got} were given"
 
 // WsHandshakeError is why an upgrade exchange did not agree.
 //
@@ -171,7 +202,18 @@ pub enum WsHandshakeError
 // message renders the refusal as one line of prose.
 impl Error for WsHandshakeError
     fn message(self) -> Str
-        todo("websocket-codec-nv.wserr.WsHandshakeError.message")
+        match self
+            NotAGetAtHttp11               => "an upgrade is a GET at HTTP/1.1"
+            WrongUpgradeToken(token)      => "the Upgrade field is \"${token}\" and not websocket"
+            MissingConnectionUpgrade      => "the Connection field does not name Upgrade"
+            MissingKey                    => "no Sec-WebSocket-Key field"
+            MalformedKey(key)             => "\"${key}\" is not the base64 of sixteen bytes"
+            UnsupportedVersion(version)   => "version ${version} is not the 13 this package speaks"
+            NotSwitchingProtocols(status) => "the response is ${status} and not 101"
+            AcceptMismatch(want, got)     => "the accept value is \"${got}\" and answers \"${want}\""
+            UnrequestedProtocol(name)     => "the server chose subprotocol \"${name}\", which was not offered"
+            UnrequestedExtension(name)    => "the server chose extension \"${name}\", which was not offered"
+            NonceWrongLength(len)         => "a nonce is sixteen bytes and ${len} were given"
 
 // http_status_for is the HTTP status a server should answer a failed
 // handshake with.
@@ -181,4 +223,11 @@ impl Error for WsHandshakeError
 // `wshandshake.version_refusal` is that whole response — and `None` for
 // the variants only a client can reach, which have nobody to answer.
 pub fn http_status_for(e: WsHandshakeError) -> ?Int
-    todo("websocket-codec-nv.wserr.http_status_for")
+    match e
+        UnsupportedVersion(_)    => Some(426)
+        NotAGetAtHttp11          => Some(400)
+        WrongUpgradeToken(_)     => Some(400)
+        MissingConnectionUpgrade => Some(400)
+        MissingKey               => Some(400)
+        MalformedKey(_)          => Some(400)
+        _                        => None

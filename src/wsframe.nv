@@ -1,8 +1,6 @@
 // wsframe.nv — a WebSocket frame as a value, and the arithmetic that
 // turns it into bytes and back.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // RFC 6455 § 5 is two bytes and then some conditional fields, and
 // almost every hand-written implementation of it gets one of four
 // things wrong.  Each of the four is a type or a refusal here rather
@@ -28,6 +26,8 @@
 // not a `mask` and an `unmask`.  It is also the only place in the
 // package where a reader touches every byte of a payload, which is
 // worth knowing before anyone optimises anything else.
+
+use wserr
 
 // WsOpcode is what a frame is for.
 //
@@ -116,22 +116,111 @@ pub enum WsScan
     // header and the mask key.
     Complete(length: Int)
 
+// WsLengthField is what the length of the frame at the front of a
+// buffer is, as far as the buffer says.
+//
+// `scan` and the reader both need the declared length before they know
+// whether the whole frame has arrived, because a declared gigabyte is
+// refused on its header and not after the gigabyte.
+pub enum WsLengthField
+    // The two fixed bytes or the extended length bytes are not all here.
+    LengthPending
+    // The 64-bit form with its top bit set, which RFC 6455 § 5.2 forbids
+    // and which no Int can count.  No amount of waiting completes it.
+    LengthUncountable
+    // The length the header declares, whatever form it was written in,
+    // and the bytes of header in front of the payload as it was written:
+    // the fixed two, the extended length and the mask key if the mask
+    // bit is set.
+    LengthDeclared(len: Int, header: Int)
+
 // The largest payload a control frame may carry (RFC 6455 § 5.5).
 pub const CONTROL_PAYLOAD_MAX = 125
 
 // The mask key's length in bytes.
 pub const MASK_KEY_LEN = 4
 
+// The opcode a four-bit code names.  The caller passes 0 to 15.
+fn opcode_from(code: Int) -> WsOpcode
+    match code
+        0x0 => Continuation
+        0x1 => TextFrame
+        0x2 => BinaryFrame
+        0x8 => ConnectionClose
+        0x9 => Ping
+        0xa => Pong
+        _   => ReservedOpcode(code)
+
+// A bit of a header byte: `mask` if the flag is set, zero if not.
+fn flag(set: Bool, mask: Int) -> Int
+    if set
+        mask
+    else
+        0
+
+// The key a header carries, or no bytes where it carries none.
+fn key_of(h: WsFrameHeader) -> [u8]
+    match h.mask_key
+        Some(k) => k[:]
+        None    => []
+
+// The number of extra length bytes the seven-bit field of the second
+// header byte announces: 0, 2 or 8.
+fn wire_form(second_byte: Int) -> Int
+    let seven = second_byte & 0x7F
+    if seven < 126
+        return 0
+    if seven == 126
+        return 2
+    8
+
+// read_length reads the length a frame header declares, from the front of
+// a buffer that may hold only part of the header.
+//
+// ```novo
+// use wsframe
+//
+// fn main() [io]
+//     match wsframe.read_length([0x82 as u8, 0x05 as u8])
+//         LengthDeclared(n, head) => println("${n} after ${head}")   // 5 after 2
+//         _                 => println("not yet")
+// ```
+pub fn read_length(buf: [u8]) -> WsLengthField
+    let n = list.len(buf)
+    if n < 2
+        return LengthPending
+    let form = wire_form(buf[1] as Int)
+    if n < 2 + form
+        return LengthPending
+    let head = 2 + form + (if (buf[1] as Int & 0x80) != 0 then MASK_KEY_LEN else 0)
+    if form == 0
+        return LengthDeclared(buf[1] as Int & 0x7F, head)
+    if form == 8 and (buf[2] as Int & 0x80) != 0
+        return LengthUncountable
+    var len = 0
+    for i in 0..form
+        len = (len << 8) | buf[2 + i] as Int
+    LengthDeclared(len, head)
+
 // opcode_number is the four-bit code a frame's opcode goes on the wire
 // as.
 pub fn opcode_number(op: WsOpcode) -> Int
-    todo("websocket-codec-nv.wsframe.opcode_number")
+    match op
+        Continuation      => 0x0
+        TextFrame         => 0x1
+        BinaryFrame       => 0x2
+        ConnectionClose   => 0x8
+        Ping              => 0x9
+        Pong              => 0xA
+        ReservedOpcode(c) => c
 
 // opcode_of reads a four-bit opcode, giving `ReservedOpcode` for the
 // nine the RFC has not assigned and `None` for a number outside
 // `0 ..= 15`.
 pub fn opcode_of(code: Int) -> ?WsOpcode
-    todo("websocket-codec-nv.wsframe.opcode_of")
+    if code < 0 or code > 15
+        return None
+    Some(opcode_from(code))
 
 // is_control says whether an opcode is a control opcode — close, ping
 // or pong.
@@ -149,13 +238,13 @@ pub fn opcode_of(code: Int) -> ?WsOpcode
 //     println("${wsframe.is_control(BinaryFrame)}")    // false
 // ```
 pub fn is_control(op: WsOpcode) -> Bool
-    todo("websocket-codec-nv.wsframe.is_control")
+    (opcode_number(op) & 0x8) != 0
 
 // header_len is how many bytes a header with these fields occupies:
 // two, plus zero, two or eight for the extended length, plus four if it
 // is masked.
 pub fn header_len(h: WsFrameHeader) -> Int
-    todo("websocket-codec-nv.wsframe.header_len")
+    2 + minimal_length_form(h.payload_len) + (if h.masked then MASK_KEY_LEN else 0)
 
 // minimal_length_form is the number of extra length bytes a payload of
 // this size must use: 0, 2 or 8.
@@ -166,7 +255,11 @@ pub fn header_len(h: WsFrameHeader) -> Int
 // would let two peers disagree about whether a byte stream is one frame
 // or two.
 pub fn minimal_length_form(payload_len: Int) -> Int
-    todo("websocket-codec-nv.wsframe.minimal_length_form")
+    if payload_len <= 125
+        return 0
+    if payload_len <= 65535
+        return 2
+    8
 
 // scan is how much of the front of `buf` is one frame.
 //
@@ -175,7 +268,15 @@ pub fn minimal_length_form(payload_len: Int) -> Int
 // a reserved bit set is still `Complete` here — the length arithmetic
 // does not care, and refusing it is `decode_header`'s job.
 pub fn scan(buf: [u8]) -> WsScan
-    todo("websocket-codec-nv.wsframe.scan")
+    let n = list.len(buf)
+    match read_length(buf)
+        LengthPending             => NeedMore
+        LengthUncountable         => NeedMore
+        LengthDeclared(len, head) =>
+            // A length near the top of an Int cannot be added to its header.
+            if len > 9223372036854775807 - head or n < head + len
+                return NeedMore
+            Complete(head + len)
 
 // encode_header is a frame header as its wire bytes.
 //
@@ -184,7 +285,32 @@ pub fn scan(buf: [u8]) -> WsScan
 // rather than as it was asked for; the field is a length, not a wire
 // format.
 pub fn encode_header(h: WsFrameHeader) -> Result<[u8], WsEncodeError>
-    todo("websocket-codec-nv.wsframe.encode_header")
+    if h.payload_len < 0
+        return Err(LengthDisagreesWithPayload(h.payload_len, 0))
+    if is_control(h.opcode) and h.payload_len > CONTROL_PAYLOAD_MAX
+        return Err(ControlPayloadTooLong(h.payload_len))
+    let key = key_of(h)
+    if h.masked and list.len(key) != MASK_KEY_LEN
+        return Err(BadMaskKey(list.len(key)))
+    let len = h.payload_len
+    let form = minimal_length_form(len)
+    var out: [u8] = []
+    list.push(out,
+        (flag(h.fin, 0x80) | flag(h.rsv1, 0x40) | flag(h.rsv2, 0x20) | flag(h.rsv3, 0x10) | (opcode_number(h.opcode) & 0xF)) as u8)
+    let seven = if form == 0
+        len
+    else
+        if form == 2
+            126
+        else
+            127
+    list.push(out, (flag(h.masked, 0x80) | seven) as u8)
+    for i in 0..form
+        list.push(out, ((len >> (8 * (form - 1 - i))) & 0xFF) as u8)
+    if h.masked
+        for b in key
+            list.push(out, b)
+    Ok(out)
 
 // decode_header reads a frame header from the front of a buffer, for an
 // endpoint in this role.
@@ -200,7 +326,54 @@ pub fn encode_header(h: WsFrameHeader) -> Result<[u8], WsEncodeError>
 // decide is whether this frame is legal HERE, which needs the sequence
 // and is `wsread`'s job.
 pub fn decode_header(buf: [u8], role: WsRole) -> Result<WsFrameHeader, WsDecodeError>
-    todo("websocket-codec-nv.wsframe.decode_header")
+    let n = list.len(buf)
+    if n < 2
+        return Err(TruncatedFrame(n))
+    let b0 = buf[0] as Int
+    let b1 = buf[1] as Int
+    if (b0 & 0x40) != 0
+        return Err(ReservedBitSet(1))
+    if (b0 & 0x20) != 0
+        return Err(ReservedBitSet(2))
+    if (b0 & 0x10) != 0
+        return Err(ReservedBitSet(3))
+    let code = b0 & 0xF
+    let op = opcode_from(code)
+    match op
+        ReservedOpcode(c) =>
+            return Err(ReservedOpcodeUsed(c))
+        _                 => ()
+    let len = match read_length(buf)
+        LengthPending          =>
+            return Err(TruncatedFrame(n))
+        LengthUncountable      =>
+            return Err(FrameTooLong(9223372036854775807, 9223372036854775807))
+        LengthDeclared(len, _) => len
+    let form = wire_form(b1)
+    if form != minimal_length_form(len)
+        return Err(NonMinimalLength(len, form))
+    let fin = (b0 & 0x80) != 0
+    if is_control(op)
+        if not fin
+            return Err(FragmentedControlFrame(code))
+        if len > CONTROL_PAYLOAD_MAX
+            return Err(ControlFrameTooLong(len))
+    let masked = (b1 & 0x80) != 0
+    match role
+        ServerSide =>
+            if not masked
+                return Err(UnmaskedClientFrame)
+        ClientSide =>
+            if masked
+                return Err(MaskedServerFrame)
+    let key_at = 2 + form
+    let key: ?[u8] = if masked and n >= key_at + MASK_KEY_LEN
+        Some(buf[key_at:key_at + MASK_KEY_LEN])
+    else
+        None
+    Ok(WsFrameHeader {
+        fin: fin, rsv1: false, rsv2: false, rsv3: false,
+        opcode: op, masked: masked, payload_len: len, mask_key: key })
 
 // mask applies the four-byte key to a payload, and is its own inverse.
 //
@@ -220,7 +393,13 @@ pub fn decode_header(buf: [u8], role: WsRole) -> Result<WsFrameHeader, WsDecodeE
 //     println("${back[0] as Int}")     // 72 — the H it started as
 // ```
 pub fn mask(payload: [u8], key: [u8]) -> [u8]
-    todo("websocket-codec-nv.wsframe.mask")
+    let n = list.len(key)
+    if n == 0
+        return list.clone(payload)
+    var out: [u8] = []
+    for i in 0..list.len(payload)
+        list.push(out, (payload[i] as Int ^ key[i % n] as Int) as u8)
+    out
 
 // encode is a whole frame as its wire bytes, masking the payload if the
 // header says to.
@@ -230,7 +409,16 @@ pub fn mask(payload: [u8], key: [u8]) -> [u8]
 // that lied about its own length is the one thing a peer cannot
 // recover from.
 pub fn encode(f: WsFrame) -> Result<[u8], WsEncodeError>
-    todo("websocket-codec-nv.wsframe.encode")
+    let h = f.header
+    let actual = list.len(f.payload)
+    if actual != h.payload_len
+        return Err(LengthDisagreesWithPayload(h.payload_len, actual))
+    let head = encode_header(h)!
+    let body = if h.masked
+        mask(f.payload, key_of(h))
+    else
+        f.payload
+    Ok(list.concat(head, body))
 
 // decode reads one whole frame from the front of a buffer, unmasking
 // the payload.
@@ -240,4 +428,82 @@ pub fn encode(f: WsFrame) -> Result<[u8], WsEncodeError>
 // are ignored rather than refused, so a caller that handed over a
 // buffer with two frames in it gets the first.
 pub fn decode(buf: [u8], role: WsRole) -> Result<WsFrame, WsDecodeError>
-    todo("websocket-codec-nv.wsframe.decode")
+    match scan(buf)
+        NeedMore        => Err(TruncatedFrame(list.len(buf)))
+        Complete(total) =>
+            let h = decode_header(buf, role)!
+            let start = header_len(h)
+            let body = buf[start:total]
+            let payload = if h.masked
+                mask(body, key_of(h))
+            else
+                body
+            Ok(WsFrame { header: h, payload: payload })
+
+// The second byte a UTF-8 lead byte may be followed by, as the lowest and
+// the highest value, and the number of continuation bytes the sequence
+// has.  RFC 3629 narrows the second byte after E0, ED, F0 and F4 so that
+// no overlong form, surrogate half or value past U+10FFFF is written.
+// A byte that leads nothing answers a count of zero.
+struct Utf8Lead
+    follow: Int
+    lo: Int
+    hi: Int
+
+fn utf8_lead(b: Int) -> Utf8Lead
+    if b >= 0xC2 and b <= 0xDF
+        return Utf8Lead { follow: 1, lo: 0x80, hi: 0xBF }
+    if b == 0xE0
+        return Utf8Lead { follow: 2, lo: 0xA0, hi: 0xBF }
+    if b == 0xED
+        return Utf8Lead { follow: 2, lo: 0x80, hi: 0x9F }
+    if b >= 0xE1 and b <= 0xEF
+        return Utf8Lead { follow: 2, lo: 0x80, hi: 0xBF }
+    if b == 0xF0
+        return Utf8Lead { follow: 3, lo: 0x90, hi: 0xBF }
+    if b == 0xF4
+        return Utf8Lead { follow: 3, lo: 0x80, hi: 0x8F }
+    if b >= 0xF1 and b <= 0xF3
+        return Utf8Lead { follow: 3, lo: 0x80, hi: 0xBF }
+    Utf8Lead { follow: 0, lo: 0, hi: 0 }
+
+// Whether the sequence led by the byte at `at` is whole and well formed.
+fn utf8_sequence_ok(buf: [u8], at: Int, lead: Utf8Lead) -> Bool
+    if at + lead.follow >= list.len(buf)
+        return false
+    let second = buf[at + 1] as Int
+    if second < lead.lo or second > lead.hi
+        return false
+    for k in 2..lead.follow + 1
+        let c = buf[at + k] as Int
+        if c < 0x80 or c > 0xBF
+            return false
+    true
+
+// utf8_fault is the offset of the first byte that starts a malformed
+// UTF-8 sequence, or nothing where the bytes are well formed.
+//
+// The rule is RFC 3629: no overlong form, no surrogate half, nothing
+// past U+10FFFF.  A sequence the buffer cuts short is malformed.
+//
+// ```novo
+// use wsframe
+//
+// fn main() [io]
+//     match wsframe.utf8_fault([0x48 as u8, 0x80 as u8])
+//         Some(at) => println("bad at ${at}")   // bad at 1
+//         None     => println("well formed")
+// ```
+pub fn utf8_fault(buf: [u8]) -> ?Int
+    let n = list.len(buf)
+    var i = 0
+    while i < n
+        let b = buf[i] as Int
+        if b < 0x80
+            i = i + 1
+        else
+            let lead = utf8_lead(b)
+            if lead.follow == 0 or not utf8_sequence_ok(buf, i, lead)
+                return Some(i)
+            i = i + lead.follow + 1
+    None

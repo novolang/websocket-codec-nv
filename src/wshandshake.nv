@@ -1,7 +1,5 @@
 // wshandshake.nv — the RFC 6455 § 4 upgrade, as a computation.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE HOST PERFORMS THE EXCHANGE; THIS PACKAGE COMPUTES IT.
 //
 // A handshake is an HTTP/1.1 request and an HTTP/1.1 response, and the
@@ -37,6 +35,12 @@
 // request twice — once as HTTP to route it, once again as a handshake
 // — and the two parsers disagreeing eventually.
 
+use std.bytes
+use std.str
+use hashing
+use h1msg
+use wserr
+
 // The magic string RFC 6455 § 4.2.2 appends to the client key before
 // hashing.  It is a constant of the protocol and identical in every
 // implementation.
@@ -69,6 +73,31 @@ pub struct WsUpgrade
     // asked for.
     extensions: [Str]
 
+// The comma-separated elements of every field of this name, trimmed,
+// with the empty ones dropped.  RFC 9110 § 5.3 lets a list field be
+// written as several fields, and each field as a comma list.
+fn list_elements(h: H1Headers, name: Str) -> [Str]
+    var out: [Str] = []
+    for v in h1msg.get_all(h, name)
+        for part in str.split(v, ",")
+            let element = str.trim(part)
+            if str.len(element) > 0
+                list.push(out, element)
+    out
+
+// Whether a list field names `token`, ignoring case.
+fn names_token(h: H1Headers, name: Str, token: Str) -> Bool
+    for element in list_elements(h, name)
+        if str.lower(element) == token
+            return true
+    false
+
+// The header section of the 101, without a subprotocol.
+fn accept_fields(key: Str) -> [H1Header]
+    [H1Header { name: "Upgrade", value: "websocket" },
+     H1Header { name: "Connection", value: "Upgrade" },
+     H1Header { name: "Sec-WebSocket-Accept", value: accept_key(key) }]
+
 // accept_key is the answer to a client key: `base64(sha1(key + GUID))`.
 //
 // The one line of the handshake that is arithmetic.  It is a pure
@@ -89,7 +118,7 @@ pub struct WsUpgrade
 //     // s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 // ```
 pub fn accept_key(client_key: Str) -> Str
-    todo("websocket-codec-nv.wshandshake.accept_key")
+    bytes.to_base64(hashing.sha1(bytes.from_str(client_key + WS_GUID)))
 
 // client_key is a `Sec-WebSocket-Key` from sixteen bytes the caller
 // supplies.
@@ -98,7 +127,9 @@ pub fn accept_key(client_key: Str) -> Str
 // package has none.  A caller passes `rand.bytes(16)`; a test passes
 // the RFC's example bytes and gets the RFC's example key.
 pub fn client_key(nonce: [u8]) -> Result<Str, WsHandshakeError>
-    todo("websocket-codec-nv.wshandshake.client_key")
+    if list.len(nonce) != NONCE_LEN
+        return Err(NonceWrongLength(list.len(nonce)))
+    Ok(bytes.to_base64(bytes.from_byte_list(nonce)))
 
 // is_valid_key says whether a string is the base64 of exactly sixteen
 // bytes.
@@ -107,7 +138,12 @@ pub fn client_key(nonce: [u8]) -> Result<Str, WsHandshakeError>
 // that forwards a handshake wants the same answer without the rest of
 // the request.
 pub fn is_valid_key(key: Str) -> Bool
-    todo("websocket-codec-nv.wshandshake.is_valid_key")
+    // Sixteen bytes are twenty-two base64 digits and two pad characters.
+    if str.len(key) != 24 or not str.ends_with(key, "==")
+        return false
+    match bytes.from_base64(key)
+        Some(raw) => bytes.len(raw) == NONCE_LEN
+        None      => false
 
 // upgrade_request is the client's handshake request, ready to be
 // written.
@@ -117,7 +153,17 @@ pub fn is_valid_key(key: Str) -> Bool
 // `Sec-WebSocket-Protocol` field is written rather than an empty one.
 pub fn upgrade_request(host: Str, target: Str, key: Str,
                        protocols: [Str]) -> Result<H1Request, WsHandshakeError>
-    todo("websocket-codec-nv.wshandshake.upgrade_request")
+    if not is_valid_key(key)
+        return Err(MalformedKey(key))
+    var fields = [
+        H1Header { name: "Host", value: host },
+        H1Header { name: "Upgrade", value: "websocket" },
+        H1Header { name: "Connection", value: "Upgrade" },
+        H1Header { name: "Sec-WebSocket-Key", value: key },
+        H1Header { name: "Sec-WebSocket-Version", value: str.from_int(WS_VERSION) }]
+    if list.len(protocols) > 0
+        list.push(fields, H1Header { name: "Sec-WebSocket-Protocol", value: str.join(protocols, ", ") })
+    Ok(H1Request { method: Get, target: target, version: Http11, headers: h1msg.headers(fields) })
 
 // check_upgrade_request reads a client's handshake request, or says
 // which of RFC 6455 § 4.1's requirements it failed.
@@ -130,7 +176,32 @@ pub fn upgrade_request(host: Str, target: Str, key: Str,
 // that decided either would be deciding it for every server built on
 // it.
 pub fn check_upgrade_request(req: H1Request) -> Result<WsUpgrade, WsHandshakeError>
-    todo("websocket-codec-nv.wshandshake.check_upgrade_request")
+    let is_get = match req.method
+        Get => true
+        _   => false
+    let is_11 = match req.version
+        Http11 => true
+        Http10 => false
+    if not (is_get and is_11)
+        return Err(NotAGetAtHttp11)
+    let h = req.headers
+    if not names_token(h, "Upgrade", "websocket")
+        return Err(WrongUpgradeToken(str.join(h1msg.get_all(h, "Upgrade"), ", ")))
+    if not names_token(h, "Connection", "upgrade")
+        return Err(MissingConnectionUpgrade)
+    let keys = h1msg.get_all(h, "Sec-WebSocket-Key")
+    if list.len(keys) == 0
+        return Err(MissingKey)
+    // Two keys are two answers, and the peer cannot be told which one was meant.
+    if list.len(keys) > 1 or not is_valid_key(keys[0])
+        return Err(MalformedKey(keys[0]))
+    let version = str.to_int(str.trim(h1msg.get(h, "Sec-WebSocket-Version") ?? "")) ?? 0
+    if version != WS_VERSION
+        return Err(UnsupportedVersion(version))
+    Ok(WsUpgrade {
+        key: keys[0], version: version,
+        protocols: list_elements(h, "Sec-WebSocket-Protocol"),
+        extensions: list_elements(h, "Sec-WebSocket-Extensions") })
 
 // upgrade_response is the server's 101, answering a key.
 //
@@ -140,7 +211,16 @@ pub fn check_upgrade_request(req: H1Request) -> Result<WsUpgrade, WsHandshakeErr
 // this function does not check that, because the server holding the
 // `WsUpgrade` is the party that knows.
 pub fn upgrade_response(key: Str, protocol: ?Str) -> Result<H1Response, WsHandshakeError>
-    todo("websocket-codec-nv.wshandshake.upgrade_response")
+    if not is_valid_key(key)
+        return Err(MalformedKey(key))
+    var fields = accept_fields(key)
+    match protocol
+        Some(p) => list.push(fields, H1Header { name: "Sec-WebSocket-Protocol", value: p })
+        None    => ()
+    Ok(H1Response { version: Http11,
+        status: 101,
+        reason: "Switching Protocols",
+        headers: h1msg.headers(fields) })
 
 // check_upgrade_response reads a server's answer against the key that
 // was sent, and gives back the subprotocol that was agreed.
@@ -155,7 +235,26 @@ pub fn upgrade_response(key: Str, protocol: ?Str) -> Result<H1Response, WsHandsh
 // key/accept pair exists for.
 pub fn check_upgrade_response(sent_key: Str, offered: [Str],
                               resp: H1Response) -> Result<?Str, WsHandshakeError>
-    todo("websocket-codec-nv.wshandshake.check_upgrade_response")
+    if resp.status != 101
+        return Err(NotSwitchingProtocols(resp.status))
+    let h = resp.headers
+    if not names_token(h, "Upgrade", "websocket")
+        return Err(WrongUpgradeToken(str.join(h1msg.get_all(h, "Upgrade"), ", ")))
+    if not names_token(h, "Connection", "upgrade")
+        return Err(MissingConnectionUpgrade)
+    let want = accept_key(sent_key)
+    let got = h1msg.get(h, "Sec-WebSocket-Accept") ?? ""
+    if got != want
+        return Err(AcceptMismatch(want, got))
+    let extensions = list_elements(h, "Sec-WebSocket-Extensions")
+    if list.len(extensions) > 0
+        return Err(UnrequestedExtension(str.trim(str.split(extensions[0], ";")[0])))
+    let chosen = list_elements(h, "Sec-WebSocket-Protocol")
+    if list.len(chosen) == 0
+        return Ok(None)
+    if not list.contains(offered, chosen[0])
+        return Err(UnrequestedProtocol(chosen[0]))
+    Ok(Some(chosen[0]))
 
 // version_refusal is the whole 426 a server answers a wrong
 // `Sec-WebSocket-Version` with, carrying the version it does speak.
@@ -165,7 +264,13 @@ pub fn check_upgrade_response(sent_key: Str, offered: [Str],
 // each server assembles, for the same reason
 // `h1write.continue_head` is one.
 pub fn version_refusal() -> H1Response
-    todo("websocket-codec-nv.wshandshake.version_refusal")
+    H1Response {
+        version: Http11, status: 426, reason: "Upgrade Required",
+        headers: h1msg.headers([
+            H1Header { name: "Upgrade", value: "websocket" },
+            H1Header { name: "Connection", value: "Upgrade" },
+            H1Header { name: "Sec-WebSocket-Version", value: str.from_int(WS_VERSION) },
+            H1Header { name: "Content-Length", value: "0" }]) }
 
 // is_websocket_upgrade says whether an HTTP request is asking for a
 // WebSocket at all.
@@ -176,4 +281,4 @@ pub fn version_refusal() -> H1Response
 // route matched it, which is why the answer is a `Bool` rather than
 // the refusal `check_upgrade_request` would produce.
 pub fn is_websocket_upgrade(req: H1Request) -> Bool
-    todo("websocket-codec-nv.wshandshake.is_websocket_upgrade")
+    names_token(req.headers, "Upgrade", "websocket") and names_token(req.headers, "Connection", "upgrade")

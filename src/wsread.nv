@@ -1,7 +1,5 @@
-// wsread.nv — the load-bearing interface: a WebSocket reader that
+// wsread.nv — a WebSocket reader that
 // performs nothing.
-//
-// Every body here is a `todo()`; the signatures are the design.
 //
 // THE SHAPE, AND WHY IT IS THIS ONE
 //
@@ -37,6 +35,11 @@
 // `PeerClose` are events, `wswrite.pong` and `wswrite.close_frame` are
 // the answers, and the host puts them on the wire.  That seam is the
 // `core` boundary, and it is the reason websocket-nv exists above this.
+
+use std.bytes
+use wserr
+use wsframe
+use wsclose
 
 // WsLimits is what a reader will refuse to grow past.
 //
@@ -102,20 +105,154 @@ pub struct WsStep
 // WsReader is the state between "some bytes turned up" and "here is an
 // event".
 //
-// Opaque: the fields are here because a struct needs them, and a caller
-// that reaches into one has coupled itself to a buffering decision this
-// package intends to change.
+// A reader changes in place: `feed` and `take` write onto the reader
+// they are given and return it in the step, so the caller keeps the one
+// in the step.  Its buffers grow as bytes arrive and are not copied
+// again when a frame is taken out of them.
+//
+// The fields are here because a struct needs them, and a caller that
+// reaches into one has coupled itself to a buffering decision this
+// package may change.
 pub struct WsReader
     role: WsRole
     limits: WsLimits
-    pending: [u8]
-    assembling: [u8]
-    consumed: Int
+    // The bytes fed so far, of which the first `consumed` are spent.
+    var pending: [u8]
+    // The data of the message being reassembled, in arrival order.
+    var assembling: [u8]
+    var consumed: Int
+    // The kind of the message in progress: 0 for none, 1 for text and 2
+    // for binary.  It stays set between the frame that ended a message
+    // and the `DataMessage` event that reports it.
+    var open: Int
+    // Whether a finished message is waiting to be reported.
+    var owed: Bool
+    // The close code of the peer's close frame, once one has arrived.
+    var peer_close: ?Int
 
 // WsDrained is a reader and every event a drain produced.
 pub struct WsDrained
     reader: WsReader
     events: [WsEvent]
+
+// The longest frame header: two fixed bytes, an eight-byte length and a
+// four-byte key.
+const MAX_HEAD = 14
+
+// The largest Int, which the length of an uncountable frame is reported as.
+const INT_MAX = 9223372036854775807
+
+fn quiet(var r: WsReader) -> Result<WsStep, WsDecodeError>
+    Ok(WsStep { reader: r, event: None })
+
+fn reported(var r: WsReader, ev: WsEvent) -> Result<WsStep, WsDecodeError>
+    Ok(WsStep { reader: r, event: Some(ev) })
+
+// Spends `total` bytes of the buffer.  Spent bytes are dropped once they
+// are half the buffer, so no byte is copied more than a few times
+// however many frames a chunk holds.
+fn consume(var r: WsReader, total: Int)
+    let spent = r.consumed + total
+    let size = list.len(r.pending)
+    if spent >= size
+        r.pending = []
+        r.consumed = 0
+    else
+        if spent * 2 >= size
+            r.pending = r.pending[spent:size]
+            r.consumed = 0
+        else
+            r.consumed = spent
+
+// The step that reports the finished message and forgets it.
+fn message_step(var r: WsReader) -> Result<WsStep, WsDecodeError>
+    let msg = if r.open == 1
+        TextMessage(r.assembling)
+    else
+        BinaryMessage(r.assembling)
+    r.assembling = []
+    r.open = 0
+    r.owed = false
+    reported(var r, DataMessage(msg))
+
+// The step for a control frame.  A close frame arrives here for every
+// opcode that is neither ping nor pong, and the header check has already
+// refused the reserved ones.
+fn control_step(var r: WsReader, f: WsFrame) -> Result<WsStep, WsDecodeError>
+    match f.header.opcode
+        Ping => reported(var r, ControlPing(f.payload))
+        Pong => reported(var r, ControlPong(f.payload))
+        _    =>
+            let c = wsclose.decode_payload(f.payload)!
+            r.peer_close = Some(wsclose.number_of(c.code))
+            reported(var r, PeerClose(c))
+
+// The step for a data frame: the sequence rules of RFC 6455 § 5.4, the
+// reassembly and the check that a finished text message is UTF-8.
+fn data_step(var r: WsReader, f: WsFrame) -> Result<WsStep, WsDecodeError>
+    let op = f.header.opcode
+    let continues = match op
+        Continuation => true
+        _            => false
+    if continues and r.open == 0
+        return Err(ContinuationWithoutStart)
+    if not continues and r.open != 0
+        return Err(InterleavedDataFrame(wsframe.opcode_number(op)))
+    let kind = if continues
+        r.open
+    else
+        if wsframe.opcode_number(op) == 1
+            1
+        else
+            2
+    let fin = f.header.fin
+    let cap = r.limits.max_message
+    let reassemble = cap > 0
+    if reassemble
+        let total = list.len(r.assembling) + list.len(f.payload)
+        if total > cap
+            return Err(MessageTooLong(total, cap))
+        list.append(r.assembling, f.payload)
+        if fin and kind == 1
+            match wsframe.utf8_fault(r.assembling)
+                Some(at) =>
+                    return Err(BadUtf8InPayload(at))
+                None     => ()
+    r.owed = fin and reassemble
+    r.open = if fin and not reassemble
+        0
+    else
+        kind
+    reported(var r, DataFrame(f))
+
+// The step for the frame at the front of the buffer, if it is whole.
+//
+// The declared length is read and checked against the frame limit before
+// the body is asked for, so a header that declares a gigabyte is refused
+// on its header.
+fn frame_step(var r: WsReader) -> Result<WsStep, WsDecodeError>
+    let held = list.len(r.pending) - r.consumed
+    let head = r.pending[r.consumed:r.consumed + (if held < MAX_HEAD then held else MAX_HEAD)]
+    let cap = r.limits.max_frame
+    let total = match wsframe.read_length(head)
+        LengthPending               =>
+            return quiet(var r)
+        LengthUncountable           =>
+            // No byte will complete this frame, so a peer that keeps sending is refused.
+            if held > MAX_HEAD
+                return Err(FrameTooLong(INT_MAX, cap))
+            return quiet(var r)
+        LengthDeclared(len, header) =>
+            if len > cap or len > INT_MAX - MAX_HEAD
+                return Err(FrameTooLong(len, cap))
+            len + header
+    if held < total
+        return quiet(var r)
+    let f = wsframe.decode(r.pending[r.consumed:r.consumed + total], r.role)!
+    consume(var r, total)
+    if wsframe.is_control(f.header.opcode)
+        return control_step(var r, f)
+    data_step(var r, f)
 
 // default_limits is a frame of 16 MiB and a message of 64 MiB.
 //
@@ -123,7 +260,7 @@ pub struct WsDrained
 // caller wants `embedded_limits`; a caller streaming wants
 // `max_message: 0`.
 pub fn default_limits() -> WsLimits
-    todo("websocket-codec-nv.wsread.default_limits")
+    WsLimits { max_frame: 16777216, max_message: 67108864 }
 
 // embedded_limits is a frame of 1 KiB and a message of 4 KiB.
 //
@@ -131,11 +268,13 @@ pub fn default_limits() -> WsLimits
 // number that matters on a microcontroller is the one that fits beside
 // everything else in 64 KiB of RAM.
 pub fn embedded_limits() -> WsLimits
-    todo("websocket-codec-nv.wsread.embedded_limits")
+    WsLimits { max_frame: 1024, max_message: 4096 }
 
 // reader is a reader holding nothing, for one end of the connection.
 pub fn reader(role: WsRole, limits: WsLimits) -> WsReader
-    todo("websocket-codec-nv.wsread.reader")
+    WsReader {
+        role: role, limits: limits, pending: [], assembling: [],
+        consumed: 0, open: 0, owed: false, peer_close: None }
 
 // feed adds bytes and takes one event, if the addition completed one.
 //
@@ -154,18 +293,36 @@ pub fn reader(role: WsRole, limits: WsLimits) -> WsReader
 //                 Some(_) => println("an event")
 //         Err(e)   => println(e.message())
 // ```
+//
+// The reader passed in is consumed: the bytes are written onto its
+// buffers, and the reader in the step is the one to keep.
 pub fn feed(r: WsReader, bytes: [u8]) -> Result<WsStep, WsDecodeError>
-    todo("websocket-codec-nv.wsread.feed")
+    var mine = r
+    list.append(mine.pending, bytes)
+    take(mine)
 
 // take takes one event if a complete one is already buffered, adding
 // nothing.
 pub fn take(r: WsReader) -> Result<WsStep, WsDecodeError>
-    todo("websocket-codec-nv.wsread.take")
+    var cur = r
+    step_of(var cur)
+
+// The step for the reader's next event, writing the reader as it goes.
+fn step_of(var r: WsReader) -> Result<WsStep, WsDecodeError>
+    match r.peer_close
+        Some(code) =>
+            if pending_len(r) > 0
+                return Err(FrameAfterClose(code))
+            return quiet(var r)
+        None       => ()
+    if r.owed
+        return message_step(var r)
+    frame_step(var r)
 
 // pending_len is how many bytes the reader is holding but has not yet
 // turned into an event.
 pub fn pending_len(r: WsReader) -> Int
-    todo("websocket-codec-nv.wsread.pending_len")
+    list.len(r.pending) - r.consumed
 
 // assembling_len is how many bytes of a fragmented message have
 // arrived so far.
@@ -175,7 +332,7 @@ pub fn pending_len(r: WsReader) -> Int
 // message, and a supervisor watching for a peer that fragments forever
 // is watching this one.
 pub fn assembling_len(r: WsReader) -> Int
-    todo("websocket-codec-nv.wsread.assembling_len")
+    list.len(r.assembling)
 
 // message_open says whether a fragmented message is in progress.
 //
@@ -183,7 +340,7 @@ pub fn assembling_len(r: WsReader) -> Int
 // and a continuation legal, and a caller deciding whether it may start
 // sending its own message needs the same answer for its own direction.
 pub fn message_open(r: WsReader) -> Bool
-    todo("websocket-codec-nv.wsread.message_open")
+    r.open != 0 and not r.owed
 
 // closed says whether a close frame has been received.
 //
@@ -191,7 +348,9 @@ pub fn message_open(r: WsReader) -> Bool
 // one with `FrameAfterClose`.  A caller checks it to know when it may
 // stop reading and close the socket.
 pub fn closed(r: WsReader) -> Bool
-    todo("websocket-codec-nv.wsread.closed")
+    match r.peer_close
+        Some(_) => true
+        None    => false
 
 // is_valid_utf8 says whether a byte list is well-formed UTF-8.
 //
@@ -203,7 +362,9 @@ pub fn closed(r: WsReader) -> Bool
 // and overlong forms, which a naive check accepts and the Autobahn
 // suite tests for.
 pub fn is_valid_utf8(bytes: [u8]) -> Bool
-    todo("websocket-codec-nv.wsread.is_valid_utf8")
+    match wsframe.utf8_fault(bytes)
+        Some(_) => false
+        None    => true
 
 // drain reads from `src` until it stops giving, and returns every event
 // that came out.
@@ -221,4 +382,21 @@ pub fn is_valid_utf8(bytes: [u8]) -> Bool
 // that could have had one: everything else takes bytes the caller
 // already holds.
 pub fn drain<S: Read[e]>(r: WsReader, src: S) -> Result<WsDrained, WsDecodeError> [e]
-    todo("websocket-codec-nv.wsread.drain")
+    var cur = r
+    var events: [WsEvent] = []
+    loop
+        if closed(cur)
+            break
+        match src.read(4096)
+            Err(_)    =>
+                break
+            Ok(chunk) =>
+                if bytes.len(chunk) == 0
+                    break
+                var step = feed(cur, bytes.to_byte_list(chunk))!
+                while step.event != None
+                    list.push(events,
+                        step.event ?? PeerClose(WsClose { code: NoStatusReceived, reason: "" }))
+                    step = take(step.reader)!
+                cur = step.reader
+    Ok(WsDrained { reader: cur, events: events })

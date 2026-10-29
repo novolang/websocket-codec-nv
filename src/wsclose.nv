@@ -1,7 +1,5 @@
 // wsclose.nv — the close handshake's status code as a typed value.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY A TYPE AND NOT AN INT
 //
 // RFC 6455 § 7.4 assigns sixteen numbers and reserves four ranges, and
@@ -19,6 +17,10 @@
 // may use for anything and nobody may interpret.  A codec that refused
 // them would be refusing the half of the space designed for its
 // callers.
+
+use std.bytes
+use wserr
+use wsframe
 
 // WsCloseCode is why a WebSocket connection is being closed.
 //
@@ -86,7 +88,24 @@ pub struct WsClose
 // logging a local close still wants the number.  Whether it may be SENT
 // is `is_sendable`, and the two are separate questions on purpose.
 pub fn number_of(c: WsCloseCode) -> Int
-    todo("websocket-codec-nv.wsclose.number_of")
+    match c
+        NormalClosure       => 1000
+        GoingAway           => 1001
+        ProtocolError       => 1002
+        UnsupportedData     => 1003
+        NoStatusReceived    => 1005
+        AbnormalClosure     => 1006
+        InvalidPayload      => 1007
+        PolicyViolation     => 1008
+        MessageTooBig       => 1009
+        MandatoryExtension  => 1010
+        InternalError       => 1011
+        ServiceRestart      => 1012
+        TryAgainLater       => 1013
+        BadGateway          => 1014
+        TlsHandshakeFailure => 1015
+        RegisteredCode(n)   => n
+        PrivateCode(n)      => n
 
 // code_of reads a two-byte close code.
 //
@@ -95,7 +114,28 @@ pub fn number_of(c: WsCloseCode) -> Int
 // 1015 with `UnsendableCloseCode`, because a peer that sent one of
 // those broke the rule and a reader has to say which rule.
 pub fn code_of(n: Int) -> Result<WsCloseCode, WsDecodeError>
-    todo("websocket-codec-nv.wsclose.code_of")
+    match n
+        1000 => Ok(NormalClosure)
+        1001 => Ok(GoingAway)
+        1002 => Ok(ProtocolError)
+        1003 => Ok(UnsupportedData)
+        1005 => Err(UnsendableCloseCode(n))
+        1006 => Err(UnsendableCloseCode(n))
+        1007 => Ok(InvalidPayload)
+        1008 => Ok(PolicyViolation)
+        1009 => Ok(MessageTooBig)
+        1010 => Ok(MandatoryExtension)
+        1011 => Ok(InternalError)
+        1012 => Ok(ServiceRestart)
+        1013 => Ok(TryAgainLater)
+        1014 => Ok(BadGateway)
+        1015 => Err(UnsendableCloseCode(n))
+        _    =>
+            if n >= 3000 and n <= 3999
+                return Ok(RegisteredCode(n))
+            if n >= 4000 and n <= 4999
+                return Ok(PrivateCode(n))
+            Err(UnassignedCloseCode(n))
 
 // is_sendable says whether a close code may appear in a close frame.
 //
@@ -112,7 +152,11 @@ pub fn code_of(n: Int) -> Result<WsCloseCode, WsDecodeError>
 //     println("${wsclose.is_sendable(AbnormalClosure)}")    // false
 // ```
 pub fn is_sendable(c: WsCloseCode) -> Bool
-    todo("websocket-codec-nv.wsclose.is_sendable")
+    match c
+        NoStatusReceived    => false
+        AbnormalClosure     => false
+        TlsHandshakeFailure => false
+        _                   => true
 
 // close_code_for is the close code RFC 6455 § 7.4.1 says to answer a
 // decode refusal with.
@@ -124,7 +168,11 @@ pub fn is_sendable(c: WsCloseCode) -> Bool
 // a codec that made the caller choose it would get a connection failed
 // with 1002 for a UTF-8 fault by every caller in a hurry.
 pub fn close_code_for(e: WsDecodeError) -> WsCloseCode
-    todo("websocket-codec-nv.wsclose.close_code_for")
+    match e
+        BadUtf8InPayload(_)  => InvalidPayload
+        FrameTooLong(_, _)   => MessageTooBig
+        MessageTooLong(_, _) => MessageTooBig
+        _                    => ProtocolError
 
 // encode_payload is a close frame's payload: two big-endian bytes of
 // code, then the reason as UTF-8.
@@ -134,7 +182,13 @@ pub fn close_code_for(e: WsDecodeError) -> WsCloseCode
 // a different thing, which `decode_payload` reports as
 // `NoStatusReceived`.
 pub fn encode_payload(c: WsClose) -> Result<[u8], WsEncodeError>
-    todo("websocket-codec-nv.wsclose.encode_payload")
+    if not is_sendable(c.code)
+        return Err(UnsendableCloseCodeToWrite(number_of(c.code)))
+    let reason = bytes.to_byte_list(bytes.from_str(c.reason))
+    if list.len(reason) > CLOSE_REASON_MAX
+        return Err(CloseReasonTooLong(list.len(reason)))
+    let n = number_of(c.code)
+    Ok(list.concat([(n >> 8) as u8, (n & 0xFF) as u8], reason))
 
 // decode_payload reads a close frame's payload.
 //
@@ -145,7 +199,16 @@ pub fn encode_payload(c: WsClose) -> Result<[u8], WsEncodeError>
 // `CloseFrameTooShort`; two or more is a code and a reason, and the
 // reason must be valid UTF-8.
 pub fn decode_payload(payload: [u8]) -> Result<WsClose, WsDecodeError>
-    todo("websocket-codec-nv.wsclose.decode_payload")
+    let n = list.len(payload)
+    if n == 0
+        return Ok(WsClose { code: NoStatusReceived, reason: "" })
+    if n == 1
+        return Err(CloseFrameTooShort(1))
+    let code = code_of((payload[0] as Int << 8) | payload[1] as Int)!
+    let reason = payload[2:n]
+    match wsframe.utf8_fault(reason)
+        Some(at) => Err(BadUtf8InPayload(2 + at))
+        None     => Ok(WsClose { code: code, reason: bytes.to_str(bytes.from_byte_list(reason)) })
 
 // The longest close reason that fits beside a two-byte code in a
 // control frame's 125 bytes.
