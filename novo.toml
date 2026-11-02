@@ -44,4 +44,4 @@ http-codec-nv = "^0.1.0"
 # package and smp-nv while the two named crypto-nv differently is
 # refused — "two packages in this build are both called 'crypto-nv'".
 # The published package is the one name.
-crypto-nv = "^0.1"
+crypto-nv = "^0.1.7"

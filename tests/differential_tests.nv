@@ -1097,7 +1097,7 @@ fn server_stream() -> [u8]
 fn render(ev: WsEvent) -> Str
     match ev
         DataFrame(f)   =>
-            // workaround(fmt-rewrites-an-if-expression-inside-a-string-interpolation-and-is-not-stable): the bit is bound first.
+            // The bit is bound first so that `novo fmt` leaves the line stable.
             let bit = if f.header.fin
                 1
             else
