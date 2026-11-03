@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.1 — 2026-11-03
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.0 — 2026-10-29
 
 The first implementation of the interface published as 0.0.1: the frame
